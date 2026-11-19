@@ -1818,8 +1818,15 @@ window.__ModuleLoader__.load({
 
     function clientService(name) {
       try {
-        return ctxRef && typeof ctxRef.get === 'function' ? ctxRef.get(name) : undefined
-      } catch (error) { return undefined }
+        if (ctxRef && typeof ctxRef.get === 'function') {
+          const fromGet = ctxRef.get(name)
+          if (fromGet != null) return fromGet
+        }
+      } catch (error) { /* fall through to the plain property */ }
+      try {
+        if (ctxRef && ctxRef[name] != null) return ctxRef[name]
+      } catch (error) { /* service not there yet */ }
+      return undefined
     }
 
     // The host conversation column materializes its composer actions on the
@@ -1850,10 +1857,11 @@ window.__ModuleLoader__.load({
       let bound = false
       try {
         const serviceState = service && service.state
+        const entryId = props.entry && typeof props.entry.id === 'string' ? props.entry.id : WORKBENCH_ID
         const owner = sessionId && serviceState && serviceState.sessionBindings
           ? serviceState.sessionBindings[sessionId]
           : undefined
-        bound = Boolean(sessionId && owner && (owner === WORKBENCH_ID || owner === serviceState.active))
+        bound = Boolean(sessionId && owner && (owner === entryId || owner === WORKBENCH_ID))
       } catch (error) { bound = false }
       const actions = bound ? readComposerActions() : undefined
       const cwd = bound && sessionId && sessionList && sessionList.byId && sessionList.byId[sessionId]
@@ -2060,24 +2068,49 @@ window.__ModuleLoader__.load({
         report('register-pane-error', { message: errText(error) })
       }
       try {
-        const workbenches = typeof ctx.get === 'function' ? ctx.get('desktopWorkbenches') : undefined
-        if (workbenches && typeof workbenches.register === 'function') {
-          ctx.effect(() => workbenches.register({
-            title: '随读·读书搭档',
-            description: '把 EPUB 放进文件夹就自动收进书架，随手取书即读；读到心里一动，AI 陪你把想法收成自己的知识库。',
-            repository: WORKBENCH_REPOSITORY,
-            panelTitle: '随读',
-            // Reading is the main task here, so the panel owns most of the
-            // width and the host's native conversation stays on the right.
-            layout: { businessSide: 'left', businessWidth: 0.6 },
-          }, ReadingWorkbench), 'reading-companion: desktop workbench')
-        } else {
-          report('workbench-missing', {})
-        }
+        ctx.effect(() => {
+          let disposer
+          let timer
+          let attempts = 0
+          let disposed = false
+          const attemptRegister = () => {
+            if (disposed) return
+            let workbenches
+            try { workbenches = clientService('desktopWorkbenches') } catch (error) { workbenches = undefined }
+            if (workbenches && typeof workbenches.register === 'function') {
+              try {
+                disposer = workbenches.register({
+                  title: '随读·读书搭档',
+                  description: '把 EPUB 放进文件夹就自动收进书架，随手取书即读；读到心里一动，AI 陪你把想法收成自己的知识库。',
+                  repository: WORKBENCH_REPOSITORY,
+                  panelTitle: '随读',
+                  // Reading is the main task here, so the panel owns most of the
+                  // width and the host's native conversation stays on the right.
+                  layout: { businessSide: 'left', businessWidth: 0.6 },
+                }, ReadingWorkbench)
+                report('workbench-registered', {})
+              } catch (error) {
+                report('register-workbench-error', { message: errText(error) })
+              }
+              return
+            }
+            attempts += 1
+            if (attempts > 8) { report('workbench-missing', { attempts }); return }
+            timer = setTimeout(attemptRegister, 500)
+          }
+          attemptRegister()
+          return () => {
+            disposed = true
+            if (timer) clearTimeout(timer)
+            if (typeof disposer === 'function') {
+              try { disposer() } catch (error) { /* the service may already be gone */ }
+            }
+          }
+        }, 'reading-companion: desktop workbench')
       } catch (error) {
         report('register-workbench-error', { message: errText(error) })
       }
-      report('client-ready', { version: '0.3.1' })
+      report('client-ready', { version: '0.3.2' })
     }
 
     return { inject: ['slots', 'connection'], apply }
