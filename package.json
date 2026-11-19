@@ -1,0 +1,61 @@
+{
+  "name": "dsh-readmate",
+  "version": "0.3.1",
+  "private": false,
+  "type": "module",
+  "description": "随读·读书搭档：把 EPUB 放进文件夹就自动收进书架，随手取书即读；读到心动处，AI 陪你把想法收进自己的知识库。",
+  "main": "./index.js",
+  "icon": "./icon.svg",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LeriusLei/dsh-readmate.git"
+  },
+  "homepage": "https://github.com/LeriusLei/dsh-readmate#readme",
+  "bugs": {
+    "url": "https://github.com/LeriusLei/dsh-readmate/issues"
+  },
+  "keywords": [
+    "epub",
+    "reader",
+    "reading",
+    "knowledge-base",
+    "dsh",
+    "dsh-workbench",
+    "reading-companion"
+  ],
+  "files": [
+    "index.js",
+    "client.js",
+    "core.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale/",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./icon.svg": "./icon.svg",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/zh.json": "./locale/zh.json",
+    "./locale/en.json": "./locale/en.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "dsh-desktop-workbenches"
+      ]
+    }
+  }
+}
