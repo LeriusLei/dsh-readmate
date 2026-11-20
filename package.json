@@ -1,9 +1,9 @@
 {
   "name": "dsh-readmate",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "private": false,
   "type": "module",
-  "description": "随读·读书搭档：把 EPUB 放进文件夹就自动收进书架，随手取书即读；读到心动处，AI 陪你把想法收进自己的知识库。",
+  "description": "随读·读书搭档：把 EPUB、PDF、AZW3、TXT 等书放进文件夹就自动收进书架，随手取书即读；读到心动处，AI 陪你把想法收进自己的知识库。",
   "main": "./index.js",
   "icon": "./icon.svg",
   "license": "MIT",

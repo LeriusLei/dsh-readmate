@@ -20,6 +20,7 @@ window.__ModuleLoader__.load({
     const RPC_CHANNEL = '/reading'
     const PANEL_KEY = 'reading'
     const TYPE_LABELS = { concept: '概念', opinion: '观点', question: '问题', application: '应用' }
+    const FORMAT_BADGE = { pdf: 'PDF', azw3: 'AZW3', azw: 'AZW', mobi: 'MOBI', txt: 'TXT', md: 'MD', html: 'HTML', docx: 'DOCX', fb2: 'FB2', rtf: 'RTF' }
     const THEME_LABELS = { auto: '跟随', paper: '米纸', dark: '夜读' }
     const FONT_FAMILIES = [
       { key: 'song', label: '宋体', stack: '"SimSun", "宋体", "Songti SC", "STSong", serif' },
@@ -300,6 +301,11 @@ window.__ModuleLoader__.load({
       const request = ++navigationRequest
       store.set({ error: '' })
       await flushReading()
+      const metaBook = store.state.books.find((item) => item.id === bookId)
+      if (metaBook !== undefined && metaBook.format !== undefined && metaBook.format !== 'epub'
+        && !['txt', 'md', 'html'].includes(metaBook.format) && !metaBook.chapterCount) {
+        toast('正在把 ' + (FORMAT_BADGE[metaBook.format] || String(metaBook.format).toUpperCase()) + ' 转成可读版本，第一次会慢一点…')
+      }
       try {
         const result = await rpc('book/open', { bookId })
         if (request !== navigationRequest) return
@@ -616,6 +622,8 @@ window.__ModuleLoader__.load({
 .rcc-cover{position:relative;width:100%;aspect-ratio:3/4;border-radius:8px;overflow:hidden;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l1);box-shadow:0 2px 8px rgba(0,0,0,.14);display:flex;align-items:center;justify-content:center}
 .rcc-cover img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block}
 .rcc-cover-fallback{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:12px;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-tertiary);text-align:center;word-break:break-word;overflow:hidden}
+.rcc-cover-page{position:absolute;inset:0;padding:14px 12px;overflow:hidden;font-size:10.5px;line-height:1.62;text-align:justify;word-break:break-word;color:var(--dsw-alias-label-secondary);font-family:"Songti SC","STSong","SimSun",Georgia,serif;background:linear-gradient(160deg,var(--dsw-alias-bg-layer-1),var(--dsw-alias-bg-layer-2));-webkit-mask-image:linear-gradient(to bottom,#000 58%,transparent 100%);mask-image:linear-gradient(to bottom,#000 58%,transparent 100%)}
+.rcc-format-badge{position:absolute;right:6px;bottom:6px;z-index:2;padding:1px 5px;border-radius:4px;background:rgba(0,0,0,.5);color:#fff;font-size:9px;letter-spacing:.06em;line-height:1.5}
 .rcc-book:hover .rcc-cover{border-color:var(--dsw-alias-border-l3)}
 .rcc-book:hover .rcc-cover img{transform:scale(1.02);transition:transform .18s ease}
 .rcc-book-title{font-size:13px;font-weight:500;line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word}
@@ -913,9 +921,9 @@ window.__ModuleLoader__.load({
           )
           : null,
         state.booksLoading && books.length === 0
-          ? h('div', { className: 'rcc-empty' }, '正在扫描 EPUB 书架…')
+          ? h('div', { className: 'rcc-empty' }, '正在扫描书架…')
           : filtered.length === 0
-            ? h('div', { className: 'rcc-empty' }, books.length === 0 ? (state.booksWarning ? '书库读取失败：' + state.booksWarning : '这个文件夹里还没有 EPUB 书籍。') : '没有找到匹配的书。')
+            ? h('div', { className: 'rcc-empty' }, books.length === 0 ? (state.booksWarning ? '书库读取失败：' + state.booksWarning : '这个文件夹里还没有可读的书籍。') : '没有找到匹配的书。')
             : h('div', { className: 'rcc-grid' }, filtered.slice(0, 400).map((book) => h('div', {
               key: book.id,
               className: 'rcc-book',
@@ -926,7 +934,9 @@ window.__ModuleLoader__.load({
               onKeyDown: (event) => { if (event.target !== event.currentTarget || event.isComposing || event.keyCode === 229) return; if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); openBook(book.id) } },
             },
             h('div', { className: 'rcc-cover' },
-              h('div', { className: 'rcc-cover-fallback' }, book.title || book.fileName || '未知书名'),
+              book.coverText
+                ? h('div', { className: 'rcc-cover-page' }, String(book.coverText).slice(0, 240))
+                : h('div', { className: 'rcc-cover-fallback' }, book.title || book.fileName || '未知书名'),
               h('img', {
                 src: '/reading/cover/' + encodeURIComponent(book.id),
                 alt: '',
@@ -934,10 +944,14 @@ window.__ModuleLoader__.load({
                 draggable: false,
                 onError: (event) => { event.currentTarget.style.display = 'none' },
               }),
+              book.format && book.format !== 'epub'
+                ? h('span', { className: 'rcc-format-badge' }, FORMAT_BADGE[book.format] || String(book.format).toUpperCase())
+                : null,
             ),
             h('div', { className: 'rcc-book-title' }, book.title || book.fileName || '未知书名'),
             h('div', { className: 'rcc-book-author' }, book.author || '未知作者'),
             h('div', { className: 'rcc-book-meta' },
+              (book.format && book.format !== 'epub' ? (FORMAT_BADGE[book.format] || String(book.format).toUpperCase()) + ' · ' : '') +
               (book.chapterCount ? book.chapterCount + ' 节 · ' : '') +
               (book.progress && book.progress.lastRead
                 ? '读到 ' + (book.progress.chapterTitle || '第 ' + ((book.progress.chapterIndex || 0) + 1) + ' 章')
@@ -2110,7 +2124,7 @@ window.__ModuleLoader__.load({
       } catch (error) {
         report('register-workbench-error', { message: errText(error) })
       }
-      report('client-ready', { version: '0.3.2' })
+      report('client-ready', { version: '0.4.0' })
     }
 
     return { inject: ['slots', 'connection'], apply }

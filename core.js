@@ -7,6 +7,7 @@ import path from 'node:path'
 import zlib from 'node:zlib'
 import crypto from 'node:crypto'
 import os from 'node:os'
+import { execFile } from 'node:child_process'
 
 // ---------------------------------------------------------------------------
 // small utilities
@@ -356,6 +357,269 @@ export function readChapter(epub, index) {
   const html = epub.zip.readText(chapter.href)
   const blocks = htmlToBlocks(html)
   return { index, title: chapter.title, blocks }
+}
+
+// ---------------------------------------------------------------------------
+// multi-format reading
+//
+// The reader itself only understands "chapters + text blocks". EPUB is parsed
+// straight from the zip. Plain text / Markdown / HTML are turned into chapters
+// in memory. Everything else (PDF, AZW3, MOBI, DOCX, FB2, RTF) is converted to
+// EPUB on demand with Calibre's `ebook-convert` and cached, so the original
+// file is never touched and reading/quoting/progress all reuse one pipeline.
+// ---------------------------------------------------------------------------
+export const FORMAT_BY_EXT = {
+  '.epub': 'epub', '.pdf': 'pdf', '.azw3': 'azw3', '.azw': 'azw', '.mobi': 'mobi',
+  '.txt': 'txt', '.md': 'md', '.markdown': 'md', '.html': 'html', '.htm': 'html',
+  '.docx': 'docx', '.fb2': 'fb2', '.rtf': 'rtf',
+}
+export const TEXT_FORMATS = new Set(['txt', 'md', 'html'])
+export const CONVERT_FORMATS = new Set(['pdf', 'azw3', 'azw', 'mobi', 'docx', 'fb2', 'rtf'])
+export const FORMAT_LABEL = { epub: 'EPUB', pdf: 'PDF', azw3: 'AZW3', azw: 'AZW', mobi: 'MOBI', txt: 'TXT', md: 'MD', html: 'HTML', docx: 'DOCX', fb2: 'FB2', rtf: 'RTF' }
+
+// Calibre libraries are full of GBK/GB18030 text files; Node's ICU can decode
+// them, so try UTF-8 first and fall back when it produces replacement chars.
+export function decodeTextBytes(bytes) {
+  const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes)
+  let text = ''
+  try {
+    text = new TextDecoder('utf-8', { fatal: false }).decode(buffer)
+  } catch {
+    text = buffer.toString('utf8')
+  }
+  const broken = (text.match(/\uFFFD/g) || []).length
+  if (broken > 2) {
+    try {
+      const legacy = new TextDecoder('gb18030').decode(buffer)
+      if ((legacy.match(/\uFFFD/g) || []).length <= broken) text = legacy
+    } catch { /* keep utf-8 */ }
+  }
+  return text.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n')
+}
+
+// `<书名> - <作者>.pdf` is the Calibre file naming; raw exports often have no
+// author in the name, in which case they end with a parenthesised author and/or
+// download-site tags such as "(Z-Library)". Strip the noise, lift the author
+// out of the last group, and leave the rest of the title readable.
+const SOURCE_NOISE = /z-?librar|z-?lib\b|1lib|annas?[-\s]?archive|libgen|epubee|bookzz|b-ok|sobooks|jx\.la|kindle|pdfdrive|magazinelib/i
+
+export function stripSourceNoise(text) {
+  let out = String(text || '')
+  for (let round = 0; round < 4; round += 1) {
+    const next = out
+      .replace(/[（(]\s*([^()（）]*?)\s*[)）]/g, (whole, inner) => (SOURCE_NOISE.test(inner) || inner.trim().length === 0 ? '' : whole))
+      .replace(/[【\[]\s*([^【】\[\]]*?)\s*[】\]]/g, (whole, inner) => (SOURCE_NOISE.test(inner) ? '' : whole))
+    if (next === out) break
+    out = next
+  }
+  return out.replace(/\s{2,}/g, ' ').trim()
+}
+
+// Dedupe key for titles: bracketed editions/author groups are ignored so a raw
+// export and its Calibre copy land in the same bucket.
+export function dedupeTitleKey(text) {
+  let out = String(text || '')
+  for (let round = 0; round < 4; round += 1) {
+    const next = out.replace(/[（(][^()（）]*[)）]/g, '').replace(/[【\[][^【】\[\]]*[】\]]/g, '')
+    if (next === out) break
+    out = next
+  }
+  return out
+    .toLowerCase()
+    .replace(/z-?librar\S*/g, '')
+    .replace(/[\s\u3000·•:：,，.。!！?？'"“”‘’《》「」『』【】()（）\[\]_-]/g, '')
+}
+
+export function parseFileName(file, fallbackAuthor = '未知作者') {
+  const base = stripSourceNoise(path.basename(file, path.extname(file)))
+  const cleaned = base.length > 0 ? base : path.basename(file, path.extname(file)).trim()
+  const dashed = /^(.*\S)\s+-\s+(.*\S)$/.exec(cleaned)
+  if (dashed !== null) return { title: dashed[1].trim(), author: dashed[2].trim() }
+  const trailing = /^(.*\S)\s*[（(]\s*([^()（）]{2,40})\s*[)）]\s*$/.exec(cleaned)
+  if (trailing !== null && !SOURCE_NOISE.test(trailing[2])) {
+    return { title: trailing[1].trim(), author: trailing[2].trim() }
+  }
+  return { title: cleaned, author: fallbackAuthor }
+}
+
+function collapseSpaces(text) {
+  return String(text || '').replace(/[ \t\u00a0]+/g, ' ').replace(/\n+/g, ' ').trim()
+}
+
+function pushParagraphBlocks(blocks, text) {
+  const cleaned = collapseSpaces(text)
+  if (cleaned.length === 0) return
+  if (cleaned.length > 6000) {
+    for (let i = 0; i < cleaned.length; i += 4000) blocks.push({ type: 'p', text: cleaned.slice(i, i + 4000) })
+  } else {
+    blocks.push({ type: 'p', text: cleaned })
+  }
+}
+
+export function paragraphsToBlocks(text) {
+  const blocks = []
+  const source = String(text || '')
+  let groups = source.split(/\n[ \t]*\n+/).map((part) => part.trim()).filter((part) => part.length > 0)
+  // Chinese .txt files usually have one paragraph per line with no blank lines.
+  if (groups.length < 4) {
+    const lines = source.split('\n').map((line) => line.trim()).filter((line) => line.length > 0)
+    if (lines.length > groups.length * 2) groups = lines
+  }
+  for (const group of groups) {
+    // Keep hard-wrapped prose together, but a run of poetry/short lines stays
+    // separate: join only when a line clearly continues the previous one.
+    const joined = group.replace(/\n(?=[^\n])/g, '')
+    pushParagraphBlocks(blocks, joined)
+  }
+  return blocks
+}
+
+function chapterTitleFrom(blocks, index, fallback) {
+  const heading = blocks.find((block) => /^h[1-3]$/.test(block.type) && block.text.length > 0)
+  if (heading !== undefined) return heading.text.slice(0, 120)
+  const first = blocks.find((block) => block.text.length > 0)
+  if (first !== undefined && fallback === true) return first.text.slice(0, 24)
+  return '第 ' + (index + 1) + ' 节'
+}
+
+const PLAIN_HEADING = /^[ \t\u3000]*(?:第[零一二三四五六七八九十百千0-9]+[章节回卷篇部集]|chapter\s+\d+|CHAPTER\s+[IVXLC0-9]+|序章|楔子|引子|前言|后记|尾声|番外)/i
+
+export function plainTextChapters(text) {
+  const lines = String(text || '').split('\n')
+  const starts = []
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i].trim()
+    if (line.length === 0 || line.length > 60) continue
+    if (PLAIN_HEADING.test(line)) starts.push({ line: i, title: line })
+  }
+  const chapters = []
+  if (starts.length >= 2) {
+    if (starts[0].line > 0) {
+      const preface = lines.slice(0, starts[0].line).join('\n')
+      const blocks = paragraphsToBlocks(preface)
+      if (blocks.length > 0) chapters.push({ title: '前言', blocks })
+    }
+    for (let i = 0; i < starts.length; i += 1) {
+      const end = i + 1 < starts.length ? starts[i + 1].line : lines.length
+      const blocks = paragraphsToBlocks(lines.slice(starts[i].line + 1, end).join('\n'))
+      chapters.push({ title: starts[i].title, blocks })
+    }
+  }
+  if (chapters.length === 0) {
+    const blocks = paragraphsToBlocks(String(text || ''))
+    if (blocks.length === 0) chapters.push({ title: '正文', blocks: [] })
+    else {
+      let current = []
+      let size = 0
+      let index = 0
+      for (const block of blocks) {
+        current.push(block)
+        size += block.text.length
+        if (size >= 2200) {
+          chapters.push({ title: '第 ' + (index + 1) + ' 节', blocks: current })
+          index += 1
+          current = []
+          size = 0
+        }
+      }
+      if (current.length > 0) chapters.push({ title: '第 ' + (index + 1) + ' 节', blocks: current })
+    }
+  }
+  return chapters
+}
+
+function stripMarkdownInline(text) {
+  return String(text || '')
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/`{1,3}([^`]*)`{1,3}/g, '$1')
+    .replace(/(\*\*|__)(.*?)\1/g, '$2')
+    .replace(/(\*|_)(.*?)\1/g, '$2')
+    .replace(/^\s*>\s?/gm, '')
+    .replace(/^\s{0,3}[-*+]\s+/gm, '· ')
+}
+
+export function markdownChapters(text) {
+  const source = String(text || '')
+  const headingRe = /^[ \t]{0,3}(#{1,3})[ \t]+(.+)$/gm
+  const marks = []
+  let match = headingRe.exec(source)
+  while (match !== null) {
+    marks.push({ start: match.index, end: match.index + match[0].length, level: match[1].length, title: match[2].trim() })
+    match = headingRe.exec(source)
+  }
+  // Ignore the document H1 as a chapter boundary when it is just the book title.
+  const chapters = []
+  if (marks.length >= 2) {
+    const offset = marks[0].start
+    const intro = stripMarkdownInline(source.slice(0, offset))
+    const introBlocks = paragraphsToBlocks(intro)
+    if (introBlocks.length > 0) chapters.push({ title: chapterTitleFrom(introBlocks, 0, true), blocks: introBlocks })
+    for (let i = 1; i < marks.length; i += 1) {
+      const end = i + 1 < marks.length ? marks[i + 1].start : source.length
+      const blocks = htmlToBlocks('<h' + Math.min(marks[i].level + 1, 6) + '>' + marks[i].title + '</h' + Math.min(marks[i].level + 1, 6) + '>' + stripMarkdownInline(source.slice(marks[i].end, end)))
+      chapters.push({ title: marks[i].title.slice(0, 120), blocks })
+    }
+  }
+  if (chapters.length === 0) {
+    const blocks = paragraphsToBlocks(stripMarkdownInline(source))
+    chapters.push({ title: '正文', blocks })
+  }
+  return chapters
+}
+
+export function htmlChapters(html) {
+  const source = String(html || '')
+  const headingRe = /<h([12])\b[^>]*>([\s\S]*?)<\/h\1>/gi
+  const marks = []
+  let match = headingRe.exec(source)
+  while (match !== null) {
+    marks.push({ start: match.index, end: match.index + match[0].length, title: collapseSpaces(decodeEntities(stripTags(match[2]))) })
+    match = headingRe.exec(source)
+  }
+  const chapters = []
+  if (marks.length >= 2) {
+    const intro = htmlToBlocks(source.slice(0, marks[0].start))
+    if (intro.length > 0) chapters.push({ title: chapterTitleFrom(intro, 0, true), blocks: intro })
+    for (let i = 0; i < marks.length; i += 1) {
+      const end = i + 1 < marks.length ? marks[i + 1].start : source.length
+      const blocks = htmlToBlocks('<h2>' + marks[i].title + '</h2>' + source.slice(marks[i].end, end))
+      chapters.push({ title: marks[i].title.slice(0, 120) || '第 ' + (i + 1) + ' 节', blocks })
+    }
+  }
+  if (chapters.length === 0) {
+    const blocks = htmlToBlocks(source)
+    chapters.push({ title: '正文', blocks })
+  }
+  return chapters
+}
+
+// Build an epub-shaped, in-memory book so the RPC layer treats every format
+// the same way. `meta` mirrors openEpub()'s meta shape.
+export function buildTextBook(file, format, fallbackTitle) {
+  const raw = decodeTextBytes(fs.readFileSync(file))
+  let chapters
+  if (format === 'html') chapters = htmlChapters(raw)
+  else if (format === 'md') chapters = markdownChapters(raw)
+  else chapters = plainTextChapters(raw)
+  chapters = chapters.filter((chapter) => chapter !== undefined && Array.isArray(chapter.blocks))
+  let title = fallbackTitle || path.basename(file, path.extname(file))
+  if (format === 'md' || format === 'html') {
+    // A leading H1 often carries the real title.
+    const first = chapters[0]
+    if (first !== undefined && first.title && first.title.length > 1 && first.title.length < 80 && fallbackTitle === undefined) title = first.title
+  }
+  return {
+    textMode: true,
+    meta: { title, author: '', language: '', coverHref: '', coverMediaType: '' },
+    chapters: chapters.map((chapter, index) => ({
+      index,
+      title: chapter.title || '第 ' + (index + 1) + ' 节',
+      blocks: chapter.blocks,
+    })),
+    toc: chapters.map((chapter, index) => ({ index, title: chapter.title || '第 ' + (index + 1) + ' 节', level: 1, href: '' })),
+    zip: { close() {} },
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1051,7 +1315,7 @@ export function createCore(options = {}) {
     return { ok: true, note: { id: result.id, title: result.title, type: result.type, related: result.related }, anchor }
   }
 
-  function walkEpubs(root, depth) {
+  function walkBookFiles(root, depth) {
     if (depth > 3) return []
     let names = []
     try { names = fs.readdirSync(root, { withFileTypes: true }) } catch { return [] }
@@ -1061,10 +1325,10 @@ export function createCore(options = {}) {
       const full = path.join(root, entry.name)
       if (entry.isDirectory()) {
         if (entry.name === 'Reading-KB') continue
-        out.push(...walkEpubs(full, depth + 1))
-      } else if (/\.epub$/i.test(entry.name)) {
+        out.push(...walkBookFiles(full, depth + 1))
+      } else if (FORMAT_BY_EXT[path.extname(entry.name).toLowerCase()] !== undefined) {
         out.push(full)
-        if (out.length > 2000) return out
+        if (out.length > 3000) return out
       }
     }
     return out
@@ -1098,6 +1362,137 @@ export function createCore(options = {}) {
     return isFile(path.join(path.dirname(file), base + '.opf'))
   }
 
+  // -------------------------------------------------------------------------
+  // multi-format: PDF/AZW3/MOBI/DOCX/FB2/RTF are converted to EPUB once with
+  // Calibre and cached; the original file stays untouched and read-only.
+  // -------------------------------------------------------------------------
+  const convertedDir = path.join(dataDir, 'converted')
+  const convertJobs = new Map()
+
+  function findEbookConvert() {
+    const candidates = []
+    if (process.env.CALIBRE_EBOOK_CONVERT) candidates.push(process.env.CALIBRE_EBOOK_CONVERT)
+    if (process.env.ProgramFiles) candidates.push(path.join(process.env.ProgramFiles, 'Calibre2', 'ebook-convert.exe'))
+    if (process.env['ProgramFiles(x86)']) candidates.push(path.join(process.env['ProgramFiles(x86)'], 'Calibre2', 'ebook-convert.exe'))
+    if (process.env.LOCALAPPDATA) candidates.push(path.join(process.env.LOCALAPPDATA, 'Programs', 'Calibre2', 'ebook-convert.exe'))
+    candidates.push('/usr/bin/ebook-convert', '/usr/local/bin/ebook-convert', '/Applications/calibre.app/Contents/MacOS/ebook-convert')
+    for (const candidate of candidates) {
+      if (candidate && isFile(candidate)) return candidate
+    }
+    const name = process.platform === 'win32' ? 'ebook-convert.exe' : 'ebook-convert'
+    for (const dir of String(process.env.PATH || '').split(path.delimiter)) {
+      if (dir.length === 0) continue
+      const candidate = path.join(dir, name)
+      if (isFile(candidate)) return candidate
+      const calibre = path.join(dir, 'Calibre2', name)
+      if (isFile(calibre)) return calibre
+    }
+    return ''
+  }
+
+  function runConverter(tool, args) {
+    return new Promise((resolve, reject) => {
+      execFile(tool, args, { timeout: 240000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
+        if (error) {
+          const detail = String(stderr || stdout || error.message || '').trim().split(/\r?\n/).filter((line) => line.trim().length > 0).slice(-4).join(' ')
+          reject(new Error('转换失败：' + (detail.length > 0 ? detail.slice(0, 300) : String(error.message || error))))
+          return
+        }
+        resolve(String(stdout || ''))
+      })
+    })
+  }
+
+  function convertedPathFor(book) {
+    return path.join(convertedDir, book.id + '.epub')
+  }
+
+  async function convertedEpub(book) {
+    const cached = convertedPathFor(book)
+    if (isFile(cached)) {
+      try {
+        if (fs.statSync(cached).size > 1024) return cached
+      } catch { /* reconvert below */ }
+    }
+    const running = convertJobs.get(book.id)
+    if (running !== undefined) return running
+    const job = (async () => {
+      const tool = findEbookConvert()
+      if (tool.length === 0) {
+        throw new Error('阅读 ' + (FORMAT_LABEL[book.format] || String(book.format).toUpperCase())
+          + ' 需要 Calibre 的 ebook-convert，但本机没有检测到 Calibre。安装 Calibre 后再打开这本书即可，或者先用 Calibre 把它转成 EPUB 放进书架。')
+      }
+      ensureDir(convertedDir)
+      const tmp = cached + '.' + process.pid + '.tmp.epub'
+      try { fs.rmSync(tmp, { force: true }) } catch { /* ignore */ }
+      const args = [book.file, tmp]
+      if (book.title) args.push('--title', String(book.title))
+      if (book.author && book.author !== '未知作者') args.push('--authors', String(book.author))
+      await runConverter(tool, args)
+      if (!isFile(tmp)) throw new Error('转换没有生成文件：' + (FORMAT_LABEL[book.format] || book.format))
+      fs.renameSync(tmp, cached)
+      // Remember the first page so the shelf can use it as the cover next scan.
+      try {
+        const epub = openEpub(cached)
+        try {
+          const chapters = []
+          for (let index = 0; index < Math.min(3, epub.chapters.length); index += 1) {
+            const chapter = readChapter(epub, index)
+            if (chapter.blocks.length > 0) chapters.push(chapter)
+          }
+          const coverText = previewFromChapters(chapters)
+          const cachedMeta = state.cache[book.file]
+          if (cachedMeta !== undefined) {
+            state.cache[book.file] = { ...cachedMeta, v: 3, format: book.format, coverText, chapterCount: epub.chapters.length }
+          }
+          book.coverText = coverText
+          book.chapterCount = epub.chapters.length
+        } finally { epub.zip.close() }
+      } catch { /* the cover preview is optional */ }
+      try { saveCache() } catch { /* ignore */ }
+      state.lastScan = undefined
+      return cached
+    })()
+    convertJobs.set(book.id, job)
+    try { return await job } finally { convertJobs.delete(book.id) }
+  }
+
+  // One container abstraction for every format: EPUB zip or in-memory text.
+  function openReadable(book) {
+    if (book.format === 'epub') {
+      const epub = openEpub(book.file)
+      if (book.title && (epub.meta.title === undefined || epub.meta.title.length === 0)) epub.meta.title = book.title
+      if (book.author && (epub.meta.author === undefined || epub.meta.author.length === 0)) epub.meta.author = book.author
+      return Promise.resolve({ kind: 'epub', container: epub })
+    }
+    if (TEXT_FORMATS.has(book.format)) {
+      const container = buildTextBook(book.file, book.format, book.title)
+      if (book.author && book.author !== '未知作者') container.meta.author = book.author
+      else if (container.meta.author === '未知作者') container.meta.author = book.author || '未知作者'
+      return Promise.resolve({ kind: 'text', container })
+    }
+    return convertedEpub(book).then((file) => {
+      const epub = openEpub(file)
+      if (book.title) epub.meta.title = book.title
+      if (book.author && book.author !== '未知作者') epub.meta.author = book.author
+      return { kind: 'epub', container: epub }
+    })
+  }
+
+  function containerChapter(source, index) {
+    if (source.kind === 'text') {
+      const chapter = source.container.chapters[index]
+      if (chapter === undefined) throw new Error('章节 ' + index + ' 不存在')
+      return { index, title: chapter.title, blocks: chapter.blocks }
+    }
+    return readChapter(source.container, index)
+  }
+
+  function containerClose(source) {
+    if (source.kind === 'text') return
+    try { source.container.zip.close() } catch { /* ignore */ }
+  }
+
   function normalizeText(text) {
     return String(text || '')
       .toLowerCase()
@@ -1111,7 +1506,7 @@ export function createCore(options = {}) {
   }
 
   function dedupeKey(title, author) {
-    return normalizeText(title) + '|' + normalizeAuthor(author)
+    return dedupeTitleKey(title) + '|' + normalizeAuthor(author)
   }
 
   // "[美]本·霍洛维茨" and "本•霍洛维茨" are the same author; raw exports often
@@ -1138,19 +1533,90 @@ export function createCore(options = {}) {
     return (candidate.mtimeMs || 0) > (current.mtimeMs || 0)
   }
 
+  function readOpfMetadata(file) {
+    const base = path.basename(file, path.extname(file))
+    const opfFile = path.join(path.dirname(file), base + '.opf')
+    if (!isFile(opfFile)) return undefined
+    try {
+      const source = fs.readFileSync(opfFile, 'utf8')
+      const title = /<dc:title[^>]*>([\s\S]*?)<\/dc:title>/i.exec(source)
+      const creator = /<dc:creator[^>]*>([\s\S]*?)<\/dc:creator>/i.exec(source)
+      return {
+        title: title === null ? '' : decodeEntities(stripTags(title[1])).trim(),
+        author: creator === null ? '' : decodeEntities(stripTags(creator[1])).trim(),
+      }
+    } catch { return undefined }
+  }
+
+  // "First page as the cover" for books without a cover image: the opening
+  // characters of the book are shown in the cover slot like a page preview.
+  function previewFromChapters(chapters) {
+    for (const chapter of chapters) {
+      const blocks = (chapter && chapter.blocks) || []
+      const parts = []
+      let size = 0
+      for (const block of blocks) {
+        if (block === undefined || typeof block.text !== 'string' || block.text.length === 0) continue
+        if (/^h[1-3]$/.test(block.type)) continue
+        parts.push(block.text)
+        size += block.text.length
+        if (size > 260) break
+      }
+      const text = parts.join(' ').replace(/\s+/g, ' ').trim()
+      if (text.length > 0) return text.slice(0, 200)
+    }
+    return ''
+  }
+
   function bookMetaFromCache(file) {
     const stat = fs.statSync(file)
     const key = file
+    const format = FORMAT_BY_EXT[path.extname(file).toLowerCase()] || 'epub'
     const cached = state.cache[key]
-    if (cached !== undefined && cached.v === 2 && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) return cached
-    let meta
-    try {
-      meta = readEpubMetadata(file)
-    } catch (error) {
-      meta = { title: path.basename(file, path.extname(file)), author: '未知作者', error: String(error && error.message || error), chapterCount: 0 }
-    }
+    const cachedFormat = cached === undefined ? '' : (cached.format || (cached.v >= 2 ? 'epub' : ''))
+    if (cached !== undefined && cached.v >= 2 && cachedFormat === format && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) return cached
+    const opf = readOpfMetadata(file)
+    const nameMeta = parseFileName(file)
     const coverFile = findSiblingCover(file)
-    const record = { ...meta, v: 2, size: stat.size, mtimeMs: stat.mtimeMs, coverFile, structured: hasSiblingOpf(file) || coverFile !== '' }
+    let meta
+    if (format === 'epub') {
+      try {
+        meta = readEpubMetadata(file)
+      } catch (error) {
+        meta = { title: nameMeta.title, author: nameMeta.author, chapterCount: 0, error: String(error && error.message || error) }
+      }
+      if (meta.title === undefined || meta.title.length === 0) meta.title = (opf && opf.title) || nameMeta.title
+      if (meta.author === undefined || meta.author.length === 0) meta.author = (opf && opf.author) || nameMeta.author
+    } else if (TEXT_FORMATS.has(format)) {
+      let chapters = []
+      try {
+        chapters = buildTextBook(file, format, (opf && opf.title) || nameMeta.title).chapters
+      } catch (error) {
+        meta = { title: nameMeta.title, author: nameMeta.author, chapterCount: 0, error: String(error && error.message || error) }
+      }
+      meta = meta || {
+        title: (opf && opf.title) || nameMeta.title,
+        author: (opf && opf.author) || nameMeta.author,
+        chapterCount: chapters.length,
+        coverText: previewFromChapters(chapters),
+      }
+    } else {
+      meta = {
+        title: (opf && opf.title) || nameMeta.title,
+        author: (opf && opf.author) || nameMeta.author,
+        chapterCount: 0,
+        coverText: cached === undefined ? '' : String(cached.coverText || ''),
+      }
+    }
+    const record = {
+      ...meta,
+      v: 3,
+      format,
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      coverFile,
+      structured: hasSiblingOpf(file) || coverFile !== '',
+    }
     state.cache[key] = record
     return record
   }
@@ -1161,7 +1627,7 @@ export function createCore(options = {}) {
   function dedupeEntries(entries) {
     const byTitle = new Map()
     for (const book of entries) {
-      const key = normalizeText(book.title)
+      const key = dedupeTitleKey(book.title)
       const group = byTitle.get(key)
       if (group === undefined) byTitle.set(key, [book])
       else group.push(book)
@@ -1192,7 +1658,7 @@ export function createCore(options = {}) {
       if (book.progress !== undefined) continue
       const twin = entries.find((entry) => entry !== book
         && entry.progress !== undefined
-        && normalizeText(entry.title) === normalizeText(book.title)
+        && dedupeTitleKey(entry.title) === dedupeTitleKey(book.title)
         && authorsCompatible(entry.author, book.author))
       if (twin !== undefined) book.progress = twin.progress
     }
@@ -1202,7 +1668,7 @@ export function createCore(options = {}) {
   function scanBooks(force) {
     if (!force && state.lastScan !== undefined && Date.now() - state.lastScan < 10000) return state.books
     const dir = epubDir()
-    const files = walkEpubs(dir, 0)
+    const files = walkBookFiles(dir, 0)
     const kbInstance = state.config.kbDir ? new KnowledgeBase(state.config.kbDir) : undefined
     const recordById = new Map()
     const recordByTitle = new Map()
@@ -1210,7 +1676,7 @@ export function createCore(options = {}) {
       kbInstance.ensure()
       for (const record of kbInstance.listBookRecords()) {
         recordById.set(record.bookId, record)
-        const key = normalizeText(record.title) + '|' + normalizeAuthor(record.author)
+        const key = dedupeTitleKey(record.title) + '|' + normalizeAuthor(record.author)
         if (!recordByTitle.has(key)) recordByTitle.set(key, record)
       }
     }
@@ -1223,7 +1689,7 @@ export function createCore(options = {}) {
       // changed, match the old record by title + author and re-home it under the
       // new id so 继续阅读 / 自动恢复 still works.
       if (record === undefined && kbInstance !== undefined) {
-        const candidate = recordByTitle.get(normalizeText(meta.title) + '|' + normalizeAuthor(meta.author))
+        const candidate = recordByTitle.get(dedupeTitleKey(meta.title) + '|' + normalizeAuthor(meta.author))
         if (candidate !== undefined && (candidate.lastRead || candidate.readingSeconds || Number(candidate.chapterIndex) > 0)) {
           record = candidate
           try {
@@ -1240,6 +1706,8 @@ export function createCore(options = {}) {
         file,
         fileName: path.basename(file),
         dir: path.dirname(file),
+        format: meta.format || 'epub',
+        coverText: meta.coverText || '',
         size: meta.size,
         mtimeMs: meta.mtimeMs,
         chapterCount: meta.chapterCount || 0,
@@ -1450,25 +1918,27 @@ export function createCore(options = {}) {
       case 'book/open': {
         const book = findBook(payload.bookId)
         if (book === undefined) throw new Error('未找到这本书，请刷新书架')
-        const epub = openEpub(book.file)
+        const source = await openReadable(book)
         try {
           const kbInstance = kb()
           const record = kbInstance.readBookRecord(book.id)
-          let chapterIndex = Math.min(Math.max(Number((record && record.chapterIndex) || payload.chapterIndex || 0), 0), epub.chapters.length - 1)
-          let chapter = readChapter(epub, chapterIndex)
+          const chapters = source.container.chapters
+          if (chapters.length === 0) throw new Error('这本书里没有可读的正文')
+          let chapterIndex = Math.min(Math.max(Number((record && record.chapterIndex) || payload.chapterIndex || 0), 0), chapters.length - 1)
+          let chapter = containerChapter(source, chapterIndex)
           // 封面/版权页等空章节自动跳到下一段有正文的章节
           if (chapter.blocks.length === 0 && !payload.exact) {
-            for (let step = 1; step < 8 && chapterIndex + step < epub.chapters.length; step += 1) {
-              const candidate = readChapter(epub, chapterIndex + step)
+            for (let step = 1; step < 8 && chapterIndex + step < chapters.length; step += 1) {
+              const candidate = containerChapter(source, chapterIndex + step)
               if (candidate.blocks.length > 0) { chapterIndex = chapterIndex + step; chapter = candidate; break }
             }
           }
           return {
             book: {
-              id: book.id, title: epub.meta.title || book.title, author: epub.meta.author || book.author,
-              file: book.file, fileName: book.fileName,
-              chapters: epub.chapters.map((item, index) => ({ index, title: item.title })),
-              toc: epub.toc.slice(0, 500),
+              id: book.id, title: source.container.meta.title || book.title, author: source.container.meta.author || book.author,
+              file: book.file, fileName: book.fileName, format: book.format,
+              chapters: chapters.map((item, index) => ({ index, title: item.title })),
+              toc: (source.container.toc || []).slice(0, 500),
             },
             progress: record === undefined ? { chapterIndex: 0, scrollRatio: 0 } : {
               chapterIndex, scrollRatio: Number(record.scrollRatio) || 0,
@@ -1477,15 +1947,15 @@ export function createCore(options = {}) {
             },
             chapter,
           }
-        } finally { epub.zip.close() }
+        } finally { containerClose(source) }
       }
       case 'book/chapter': {
         const book = findBook(payload.bookId)
         if (book === undefined) throw new Error('未找到这本书')
-        const epub = openEpub(book.file)
+        const source = await openReadable(book)
         try {
-          return { chapter: readChapter(epub, Number(payload.index) || 0) }
-        } finally { epub.zip.close() }
+          return { chapter: containerChapter(source, Number(payload.index) || 0) }
+        } finally { containerClose(source) }
       }
       case 'book/progress': {
         const book = findBook(payload.bookId)

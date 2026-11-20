@@ -1,12 +1,14 @@
 # 随读·读书搭档（dsh-readmate）
 
-一个安静的 AI 阅读工作台：左边读书，右边和 AI 说话。把 EPUB 放进一个文件夹，书架自己就长出来了；读到心里一动的地方，AI 顺手把想法收进你自己的知识库。
+一个安静的 AI 阅读工作台：左边读书，右边和 AI 说话。把 EPUB、PDF、AZW3、TXT 等书放进一个文件夹，书架自己就长出来了；读到心里一动的地方，AI 顺手把想法收进你自己的知识库。
 
 > DSH Desktop 工作台插件，工作台内部 = 阅读器（左，约 60%）+ 宿主原生对话（右）。
 
 ## 它能做什么
 
-- **自动书架**：扫描你指定的 EPUB 文件夹（支持 Calibre 那种「作者/书名/书籍文件」的层级），显示封面与书名，随时继续上次读到的地方。
+- **自动书架**：扫描你指定的书籍文件夹（支持 Calibre 那种「作者/书名/书籍文件」的层级），显示封面与书名，随时继续上次读到的地方。
+- **多种格式都能读**：EPUB 直接读；TXT / Markdown / HTML 原生阅读；PDF、AZW3、MOBI、AZW、DOCX、FB2、RTF 在本机装有 [Calibre](https://calibre-ebook.com/) 时自动转成可读版本（第一次打开慢一点，之后走缓存）。没装 Calibre 也能读 EPUB、TXT、Markdown、HTML。
+- **封面自动兜底**：优先用书旁/书里的封面图；没有封面时，用正文第一页的文字做成安静的纸页封面。
 - **安静阅读**：目录、正文、字号/行距/字体/阅读主题，进度自动保存，重开应用接着读。
 - **选中即问**：选中正文里的句子，可以「收藏」「写想法」「解释」「问 AI」；提问时书名、作者、章节和原文会自动带上，不用复制粘贴。
 - **自动知识库**：你说出的观点、联想、疑问会被整理成 Markdown 知识卡片（原始表达 + 核心观点 + 出处 + 关联），并自动双向链接；也能一键收藏原文。
@@ -26,12 +28,12 @@
 pnpm add <本仓库路径或 tgz>
 ```
 
-本包同时包含 Host 半边（`index.js` / `core.js`：EPUB 解析、知识库读写、Agent 工具、`/reading` RPC 路由）与 Client 半边（`client.js`：工作台界面），
+本包同时包含 Host 半边（`index.js` / `core.js`：EPUB 解析、多格式读取、知识库读写、Agent 工具、`/reading` RPC 路由）与 Client 半边（`client.js`：工作台界面），
 通过 `cordis.patch.yml` 注册插件层与「随读」Agent 预设。
 
 ## 首次使用
 
-1. 打开工作台，选择你的 EPUB 文件夹（例如 Calibre 导出目录）。
+1. 打开工作台，选择你的书籍文件夹（例如 Calibre 导出目录）。
 2. 选择知识库目录（默认 `~/Reading-KB`），之后不用再设置。
 3. 点右侧「开始对话」（或在选中原文时点「问 AI」）和 AI 边读边聊。
 
@@ -45,7 +47,7 @@ Reading-KB/
   reports/      读后文章
 ```
 
-原始 EPUB 只读：插件不会修改、移动或覆盖你的书籍文件。
+原始书籍文件只读：插件不会修改、移动或覆盖你的书籍文件；需要格式转换时只是另存一份缓存（`~/.dsh-reading-companion/converted/`）。
 
 ## 隐私
 
@@ -65,12 +67,15 @@ MIT
 # Readmate · Reading Companion (English)
 
 A quiet AI reading workbench for DSH Desktop: read on the left, talk with the AI on the right.
-Drop EPUB files into a folder and you get a shelf with covers; highlight a sentence to collect it, write a thought,
-or ask the AI — the book, chapter and selected text travel with your question. Thoughts become Markdown knowledge
-cards in your own folder (with backlinks and cross-book search), and finishing a book turns the conversation into
-an article in your knowledge base.
+Drop EPUB, PDF, AZW3, TXT and other books into a folder and you get a shelf with covers (a book without a cover falls
+back to a page-one text preview); highlight a sentence to collect it, write a thought, or ask the AI — the book,
+chapter and selected text travel with your question. EPUB, TXT, Markdown and HTML are read natively; PDF, AZW3, MOBI,
+AZW, DOCX, FB2 and RTF are converted on first open through a local [Calibre](https://calibre-ebook.com/) install (a
+cached copy is kept, the original file is never touched). Thoughts become Markdown knowledge cards in your own folder
+(with backlinks and cross-book search), and finishing a book turns the conversation into an article in your knowledge
+base.
 
-Install it from the DSH workbench market or as a plugin bundle, restart DSH Desktop, then pick your EPUB folder
-and knowledge-base folder once. Everything stays local as plain Markdown; original EPUB files are never modified.
+Install it from the DSH workbench market or as a plugin bundle, restart DSH Desktop, then pick your books folder
+and knowledge-base folder once. Everything stays local as plain Markdown; original book files are never modified.
 
 MIT License.
