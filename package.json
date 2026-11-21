@@ -3,7 +3,7 @@
   "version": "0.5.1",
   "private": false,
   "type": "module",
-  "description": "随读 · 读书搭档：左边读书并标注学习，右边聊书或进行分析，想法笔记自动分类存进知识库。支持 EPUB、PDF、AZW3、TXT 等文件。",
+  "description": "随读 · 读书搭档：左边阅读书目、划线收藏记录想法，右边和 AI 对话分析提问，想法笔记自动分类存入本地知识库。支持 EPUB、PDF、AZW3、TXT 等文件。",
   "main": "./index.js",
   "icon": "./icon.svg",
   "license": "MIT",
