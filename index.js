@@ -12,7 +12,7 @@ export const inject = ['connection', 'tools', 'webServer']
 
 const CHANNEL = '/reading'
 const MAX_BODY_BYTES = 8 * 1024 * 1024
-const VERSION = '0.4.0'
+const VERSION = '0.5.1'
 
 function readBody(req) {
   return new Promise((resolve, reject) => {

@@ -359,23 +359,87 @@ export function readChapter(epub, index) {
   return { index, title: chapter.title, blocks }
 }
 
+// Calibre-converted EPUBs rarely carry a table of contents, so every spine item
+// ends up with the generic "第 N 节" fallback. Name those chapters after their
+// first heading or first line instead, so a PDF reads like a real book.
+export function deriveChapterTitle(blocks) {
+  const clean = (value) => String(value || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    // PDF text layers often put a space between every CJK glyph; undo it in titles.
+    .replace(/([\u3400-\u9fff\uf900-\ufaff])\s+(?=[\u3400-\u9fff\uf900-\ufaff])/g, '$1')
+  const first = []
+  for (const block of blocks) {
+    if (String(block.text || '').trim().length === 0) continue
+    first.push({ text: clean(block.text), heading: /^h[1-6]$/.test(block.type) })
+    if (first.length >= 2) break
+  }
+  if (first.length === 0) return ''
+  let text = first[0].text
+  // "第 3 章" alone is a poor title; append the short heading/line that follows.
+  // Calibre flattens PDF headings into plain <p> blocks, so also join two short lines
+  // as long as the second one is not already a full sentence.
+  if (first.length > 1) {
+    const second = first[1].text
+    const headingLike = second.length <= 24 && !/[。！？；，,：:]/.test(second)
+    if (headingLike && (first[0].heading || first[1].heading || text.length <= 8)) text = text + ' ' + second
+  }
+  const stop = text.search(/[。！？；]/)
+  if (stop > 1) text = text.slice(0, stop)
+  text = text.replace(/^[\s,，、;；:：.。\-—…·]+|[\s,，、;；:：.。\-—…·]+$/g, '')
+  if (text.length < 2) return ''
+  if (/^[\d\s.、()（）\-—]+$/.test(text)) return ''
+  if (text.length > 32) text = text.slice(0, 32) + '…'
+  return text
+}
+
+const derivedTitleMemo = new Map()
+
+function titleMemoKeyFor(file) {
+  if (!file) return ''
+  try {
+    const stat = fs.statSync(file)
+    return file + '|' + stat.size + '|' + Math.round(stat.mtimeMs)
+  } catch { return '' }
+}
+
+export function refineChapterTitles(epub, sourceFile = '') {
+  const memoKey = titleMemoKeyFor(sourceFile)
+  const memo = memoKey === '' ? undefined : derivedTitleMemo.get(memoKey)
+  if (Array.isArray(memo) && memo.length === epub.chapters.length) {
+    epub.chapters.forEach((chapter, index) => { if (memo[index]) chapter.title = memo[index] })
+    return
+  }
+  const titles = epub.chapters.map((chapter) => chapter.title)
+  for (let index = 0; index < epub.chapters.length; index++) {
+    if (!/^第 \d+ 节$/.test(titles[index])) continue
+    try {
+      const derived = deriveChapterTitle(readChapter(epub, index).blocks)
+      if (derived.length > 0) {
+        epub.chapters[index].title = derived
+        titles[index] = derived
+      }
+    } catch { /* unreadable spine item: keep the fallback title */ }
+  }
+  if (memoKey !== '') {
+    if (derivedTitleMemo.size > 40) derivedTitleMemo.delete(derivedTitleMemo.keys().next().value)
+    derivedTitleMemo.set(memoKey, titles)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // multi-format reading
 //
 // The reader itself only understands "chapters + text blocks". EPUB is parsed
 // straight from the zip. Plain text / Markdown / HTML are turned into chapters
-// in memory. Everything else (PDF, AZW3, MOBI, DOCX, FB2, RTF) is converted to
+// in memory. Everything else (PDF, AZW3, MOBI, FB2) is converted to
 // EPUB on demand with Calibre's `ebook-convert` and cached, so the original
 // file is never touched and reading/quoting/progress all reuse one pipeline.
 // ---------------------------------------------------------------------------
-export const FORMAT_BY_EXT = {
-  '.epub': 'epub', '.pdf': 'pdf', '.azw3': 'azw3', '.azw': 'azw', '.mobi': 'mobi',
-  '.txt': 'txt', '.md': 'md', '.markdown': 'md', '.html': 'html', '.htm': 'html',
-  '.docx': 'docx', '.fb2': 'fb2', '.rtf': 'rtf',
-}
-export const TEXT_FORMATS = new Set(['txt', 'md', 'html'])
-export const CONVERT_FORMATS = new Set(['pdf', 'azw3', 'azw', 'mobi', 'docx', 'fb2', 'rtf'])
-export const FORMAT_LABEL = { epub: 'EPUB', pdf: 'PDF', azw3: 'AZW3', azw: 'AZW', mobi: 'MOBI', txt: 'TXT', md: 'MD', html: 'HTML', docx: 'DOCX', fb2: 'FB2', rtf: 'RTF' }
+export const FORMAT_BY_EXT = { '.epub': 'epub', '.pdf': 'pdf', '.azw3': 'azw3', '.azw': 'azw', '.mobi': 'mobi', '.txt': 'txt', '.fb2': 'fb2' }
+export const TEXT_FORMATS = new Set(['txt'])
+export const CONVERT_FORMATS = new Set(['pdf', 'azw3', 'azw', 'mobi', 'fb2'])
+export const FORMAT_LABEL = { epub: 'EPUB', pdf: 'PDF', azw3: 'AZW3', azw: 'AZW', mobi: 'MOBI', txt: 'TXT', fb2: 'FB2' }
 
 // Calibre libraries are full of GBK/GB18030 text files; Node's ICU can decode
 // them, so try UTF-8 first and fall back when it produces replacement chars.
@@ -1315,20 +1379,19 @@ export function createCore(options = {}) {
     return { ok: true, note: { id: result.id, title: result.title, type: result.type, related: result.related }, anchor }
   }
 
-  function walkBookFiles(root, depth) {
-    if (depth > 3) return []
-    let names = []
-    try { names = fs.readdirSync(root, { withFileTypes: true }) } catch { return [] }
-    const out = []
-    for (const entry of names) {
-      if (entry.name.startsWith('.') || entry.name === 'node_modules') continue
-      const full = path.join(root, entry.name)
-      if (entry.isDirectory()) {
-        if (entry.name === 'Reading-KB') continue
-        out.push(...walkBookFiles(full, depth + 1))
-      } else if (FORMAT_BY_EXT[path.extname(entry.name).toLowerCase()] !== undefined) {
-        out.push(full)
-        if (out.length > 3000) return out
+  function walkBookFiles(root) {
+    const out = [], pending = [path.resolve(root)]
+    const excluded = new Set([state.config.kbDir, dataDir].filter(Boolean).map(dir => path.resolve(dir).toLowerCase()))
+    while (pending.length) {
+      const dir = pending.pop()
+      if (excluded.has(dir.toLowerCase())) continue
+      let entries
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch { continue }
+      for (const entry of entries) {
+        if (entry.isSymbolicLink() || ['node_modules', '.git', '.reading-companion', '$RECYCLE.BIN'].includes(entry.name)) continue
+        const full = path.join(dir, entry.name)
+        if (entry.isDirectory()) pending.push(full)
+        else if (entry.isFile() && FORMAT_BY_EXT[path.extname(entry.name).toLowerCase()]) out.push(full)
       }
     }
     return out
@@ -1363,11 +1426,13 @@ export function createCore(options = {}) {
   }
 
   // -------------------------------------------------------------------------
-  // multi-format: PDF/AZW3/MOBI/DOCX/FB2/RTF are converted to EPUB once with
+  // multi-format: PDF/AZW3/MOBI/FB2 are converted to EPUB once with
   // Calibre and cached; the original file stays untouched and read-only.
   // -------------------------------------------------------------------------
   const convertedDir = path.join(dataDir, 'converted')
   const convertJobs = new Map()
+  const sourceStamp = file => { const s = fs.statSync(file); return { size: s.size, mtimeMs: s.mtimeMs } }
+  const sameStamp = (a, b) => a?.size === b?.size && a?.mtimeMs === b?.mtimeMs
 
   function findEbookConvert() {
     const candidates = []
@@ -1409,9 +1474,10 @@ export function createCore(options = {}) {
 
   async function convertedEpub(book) {
     const cached = convertedPathFor(book)
+    const stamp = sourceStamp(book.file)
     if (isFile(cached)) {
       try {
-        if (fs.statSync(cached).size > 1024) return cached
+        if (fs.statSync(cached).size > 1024 && sameStamp(readJson(cached + '.source.json', {}), stamp)) return cached
       } catch { /* reconvert below */ }
     }
     const running = convertJobs.get(book.id)
@@ -1430,7 +1496,9 @@ export function createCore(options = {}) {
       if (book.author && book.author !== '未知作者') args.push('--authors', String(book.author))
       await runConverter(tool, args)
       if (!isFile(tmp)) throw new Error('转换没有生成文件：' + (FORMAT_LABEL[book.format] || book.format))
+      if (!sameStamp(sourceStamp(book.file), stamp)) { try { fs.rmSync(tmp, { force: true }) } catch {} throw new Error('原文件在转换期间发生变化，请重新打开') }
       fs.renameSync(tmp, cached)
+      writeJson(cached + '.source.json', stamp)
       // Remember the first page so the shelf can use it as the cover next scan.
       try {
         const epub = openEpub(cached)
@@ -1473,6 +1541,7 @@ export function createCore(options = {}) {
     }
     return convertedEpub(book).then((file) => {
       const epub = openEpub(file)
+      try { refineChapterTitles(epub, book.file) } catch { /* titles are optional */ }
       if (book.title) epub.meta.title = book.title
       if (book.author && book.author !== '未知作者') epub.meta.author = book.author
       return { kind: 'epub', container: epub }
@@ -1682,7 +1751,8 @@ export function createCore(options = {}) {
     }
     const entries = []
     for (const file of files) {
-      const meta = bookMetaFromCache(file)
+      let meta
+      try { meta = bookMetaFromCache(file) } catch { continue /* file moved during scan */ }
       const id = hashId(file.toLowerCase())
       let record = kbInstance === undefined ? undefined : recordById.get(id)
       // Reading progress follows the book across library moves: if the file path
@@ -1727,6 +1797,7 @@ export function createCore(options = {}) {
       entries.push(book)
     }
     const books = dedupeEntries(entries)
+    state.entries = entries
     // newest read first, then title
     books.sort((a, b) => {
       const at = (a.progress && a.progress.lastRead) || ''
@@ -1742,7 +1813,7 @@ export function createCore(options = {}) {
 
   function findBook(bookId) {
     const books = scanBooks(false)
-    return books.find((book) => book.id === bookId)
+    return books.find((book) => book.id === bookId) || state.entries?.find((book) => book.id === bookId)
   }
 
   function sniffImageMime(bytes) {
@@ -1847,8 +1918,110 @@ export function createCore(options = {}) {
     } catch { return { ok: false } }
   }
 
+  // Imports are staged outside the watched library and published only when complete.
+  const importJobs = new Map()
+  const maxImportBytes = 512 * 1024 * 1024
+  const importsDir = path.join(dataDir, 'imports')
+  function cancelImport(id) {
+    const job = importJobs.get(String(id))
+    if (job) { try { fs.rmSync(job.temporary, { force: true }) } catch {} importJobs.delete(String(id)) }
+    return { cancelled: Boolean(job) }
+  }
+  function startImport(payload) {
+    const name = String(payload.name || '').normalize('NFC')
+    const size = Number(payload.size)
+    if (!name || name.length > 220 || /[<>:"/\\|?*\x00-\x1f]/.test(name) || /[. ]$/.test(name) || /^(con|prn|aux|nul|com\d|lpt\d)(\.|$)/i.test(name)) throw new Error('文件名无效')
+    if (!FORMAT_BY_EXT[path.extname(name).toLowerCase()]) throw new Error('暂不支持这个格式：' + path.extname(name))
+    if (!Number.isSafeInteger(size) || size < 1 || size > maxImportBytes) throw new Error('导入文件大小需在 1 字节到 512 MB 之间')
+    for (const [id, job] of importJobs) if (Date.now() - job.created > 60 * 60 * 1000) cancelImport(id)
+    if (importJobs.size >= 8) throw new Error('已有多个导入任务，请等待完成')
+    const root = fs.realpathSync(epubDir())
+    ensureDir(importsDir)
+    const id = crypto.randomUUID(), temporary = path.join(importsDir, id + '.part')
+    fs.writeFileSync(temporary, Buffer.alloc(0), { flag: 'wx' })
+    importJobs.set(id, { name, size, root, temporary, received: 0, created: Date.now() })
+    return { id, chunkBytes: 3 * 1024 * 1024 }
+  }
+  async function digestFile(file) {
+    const hash = crypto.createHash('sha256')
+    for await (const bytes of fs.createReadStream(file)) hash.update(bytes)
+    return hash.digest('hex')
+  }
+  async function finishImport(id) {
+    const job = importJobs.get(String(id))
+    if (!job) throw new Error('导入任务不存在或已过期')
+    if (job.received !== job.size || fs.statSync(job.temporary).size !== job.size) throw new Error('文件尚未传输完整')
+    if (fs.realpathSync(epubDir()) !== job.root) throw new Error('目标文件夹已切换，请重新导入')
+    const dir = path.join(job.root, '导入')
+    ensureDir(dir)
+    const actualDir = fs.realpathSync(dir)
+    const rel = path.relative(job.root, actualDir)
+    if (rel.startsWith('..') || path.isAbsolute(rel)) throw new Error('导入目录不在目标文件夹内')
+    const digest = await digestFile(job.temporary)
+    const candidates = walkBookFiles(job.root).filter(file => { try { return fs.statSync(file).size === job.size } catch { return false } })
+    for (const file of candidates) {
+      if (await digestFile(file) === digest) { cancelImport(id); return { imported: false, duplicate: true, name: path.basename(file), bookId: hashId(file.toLowerCase()) } }
+    }
+    const ext = path.extname(job.name), base = job.name.slice(0, -ext.length)
+    let target
+    for (let n = 1; n < 10000; n++) {
+      target = path.join(actualDir, n === 1 ? job.name : base + ' (' + n + ')' + ext)
+      try { await fs.promises.copyFile(job.temporary, target, fs.constants.COPYFILE_EXCL); break }
+      catch (error) { if (error.code !== 'EEXIST' || n === 9999) throw error }
+    }
+    cancelImport(id)
+    state.lastScan = undefined
+    return { imported: true, name: path.basename(target), bookId: hashId(target.toLowerCase()) }
+  }
+
   async function rpc(method, payload = {}) {
     switch (method) {
+      case 'library/import/clipboard': {
+        let paths
+        if (typeof options.clipboardFilePaths === 'function') paths = await options.clipboardFilePaths()
+        else {
+          if (process.platform !== 'win32') return { results: [], empty: true }
+          // Fixed command, invoked only by an explicit paste action; no user text is executed.
+          const command = "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); Add-Type -AssemblyName System.Windows.Forms; ConvertTo-Json -Compress -InputObject @([System.Windows.Forms.Clipboard]::GetFileDropList())"
+          paths = await new Promise((resolve, reject) => execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-STA', '-Command', command], { windowsHide: true, timeout: 10000, maxBuffer: 256 * 1024 }, (error, stdout) => {
+            if (error) { reject(new Error('无法读取文件剪贴板，请拖入文件或使用导入按钮')); return }
+            try { resolve(JSON.parse(String(stdout).replace(/^\uFEFF/, '').trim() || '[]')) } catch { reject(new Error('无法读取文件剪贴板')) }
+          }))
+        }
+        if (!Array.isArray(paths) || !paths.length) return { results: [], empty: true }
+        return rpc('library/import/paths', { paths })
+      }
+      case 'library/import/start': return startImport(payload)
+      case 'library/import/chunk': {
+        const job = importJobs.get(String(payload.id))
+        if (!job) throw new Error('导入任务不存在或已过期')
+        const encoded = String(payload.data || '')
+        if (encoded.length > 4 * 1024 * 1024 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded) || encoded.length % 4 !== 0) throw new Error('无效的文件数据')
+        const bytes = Buffer.from(encoded, 'base64')
+        if (payload.offset !== job.received || !bytes.length || job.received + bytes.length > job.size) throw new Error('文件分块顺序或长度不正确')
+        fs.appendFileSync(job.temporary, bytes)
+        job.received += bytes.length
+        return { received: job.received }
+      }
+      case 'library/import/finish': return finishImport(payload.id)
+      case 'library/import/cancel': return cancelImport(payload.id)
+      case 'library/import/paths': {
+        if (!Array.isArray(payload.paths) || !payload.paths.length || payload.paths.length > 100) throw new Error('一次可导入 1–100 个文件')
+        const results = []
+        for (const raw of payload.paths) {
+          let started
+          try {
+            const file = String(raw)
+            if (!path.isAbsolute(file) || !fs.statSync(file).isFile()) throw new Error('需要绝对文件路径')
+            started = startImport({ name: path.basename(file), size: fs.statSync(file).size })
+            const job = importJobs.get(started.id)
+            await fs.promises.copyFile(file, job.temporary)
+            job.received = fs.statSync(job.temporary).size
+            results.push(await finishImport(started.id))
+          } catch (error) { if (started) cancelImport(started.id); results.push({ imported: false, error: String(error.message || error), name: path.basename(String(raw)) }) }
+        }
+        return { results }
+      }
       case 'config/get': {
         const configured = Boolean(state.config.epubDir && state.config.kbDir)
         let stats
@@ -1909,11 +2082,11 @@ export function createCore(options = {}) {
         let books = []
         let warning = ''
         try {
-          books = scanBooks(false)
+          books = scanBooks(Boolean(payload.force))
         } catch (error) {
           warning = String(error && error.message ? error.message : error)
         }
-        return { books, total: books.length, epubDir: state.config.epubDir || '', warning }
+        return { books, files: state.entries || books, total: books.length, fileTotal: (state.entries || books).length, formats: FORMAT_LABEL, epubDir: state.config.epubDir || '', warning }
       }
       case 'book/open': {
         const book = findBook(payload.bookId)

@@ -1,8 +1,8 @@
-# 随读·读书搭档（dsh-readmate）
+# 随读 · 读书搭档（dsh-readmate）
 
-**左边读书，右边聊书，想法自动长成知识库。**
+左边读书，并标注学习，右边聊书或进行分析，想法笔记自动分类存进知识库。支持 EPUB、PDF、AZW3、TXT 等文件。
 
-一个安静的 AI 阅读工作台：左边读书，右边和 AI 说话。把 EPUB、PDF、AZW3、TXT 等书放进一个文件夹，书架自己就长出来了；读到心里一动的地方，AI 顺手把想法收进你自己的知识库。
+一个安静的 AI 阅读工作台：把书放进一个文件夹，书架自己就长出来了；读到心里一动的地方，AI 顺手把想法收进你自己的知识库。
 
 > DSH Desktop 工作台插件，工作台内部 = 阅读器（左，约 60%）+ 宿主原生对话（右）。
 
@@ -10,10 +10,20 @@
 
 ![随读阅读页：左边划线、右边问 AI，原文与章节自动带上](docs/images/02-reading.png)
 
+## 示例：两本书，两种读法
+
+把书放进你的书籍文件夹（例如 Calibre 库的导出目录）即可，例如：
+
+- **《献给阿尔吉侬的花束》.epub** — EPUB 直接打开，左侧阅读器分章显示，划词即可提问。
+- **《深度学习入门：基于Python的理论与实现》.pdf** — PDF 第一次打开时会用本机 Calibre 自动转成可读版本（稍等片刻，之后走缓存），随后和 EPUB 一样分章阅读、划词提问；原 PDF 不会被修改。
+
+两本书都在同一个书架里，进度、笔记和知识库不分格式。
+
 ## 它能做什么
 
 - **自动书架**：扫描你指定的书籍文件夹（支持 Calibre 那种「作者/书名/书籍文件」的层级），显示封面与书名，随时继续上次读到的地方。
-- **多种格式都能读**：EPUB 直接读；TXT / Markdown / HTML 原生阅读；PDF、AZW3、MOBI、AZW、DOCX、FB2、RTF 在本机装有 [Calibre](https://calibre-ebook.com/) 时自动转成可读版本（第一次打开慢一点，之后走缓存）。没装 Calibre 也能读 EPUB、TXT、Markdown、HTML。
+- **常用电子书格式**：EPUB、TXT 直接阅读；PDF、AZW3、MOBI、AZW、FB2 使用本机 Calibre 转换后阅读。书架固定封面网格，支持选择、拖入及粘贴导入；导入结果以临时浮层显示。
+- **章节名自动整理**：PDF、AZW3 这类转出来的书原本没有目录，插件会按正文里的首个标题给每一章命名，而不是让你面对一串「第 1 节、第 2 节」。
 - **封面自动兜底**：优先用书旁/书里的封面图；没有封面时，用正文第一页的文字做成安静的纸页封面。
 - **安静阅读**：目录、正文、字号/行距/字体/阅读主题，进度自动保存，重开应用接着读。
 - **选中即问**：选中正文里的句子，可以「收藏」「写想法」「解释」「问 AI」；提问时书名、作者、章节和原文会自动带上，不用复制粘贴。
@@ -25,7 +35,7 @@
 
 ### 从工作台市场安装
 
-在 DSH Desktop 的「工作台市场」里找到「随读·读书搭档」并安装，重启桌面应用即可在左侧工作台切换入口看到它。
+在 DSH Desktop 的「工作台市场」里找到「随读 · 读书搭档」并安装，重启桌面应用即可在左侧工作台切换入口看到它。
 
 ### 手动安装（开发者）
 
@@ -72,14 +82,21 @@ MIT
 
 # Readmate · Reading Companion (English)
 
-A quiet AI reading workbench for DSH Desktop: read on the left, talk with the AI on the right.
-Drop EPUB, PDF, AZW3, TXT and other books into a folder and you get a shelf with covers (a book without a cover falls
+Read and annotate on the left; chat about or analyze the book on the right, and let your thoughts and notes be classified into your knowledge base automatically. Supports EPUB, PDF, AZW3, TXT and more.
+
+A quiet AI reading workbench for DSH Desktop. Drop EPUB, PDF, AZW3, TXT and other books into a folder and you get a shelf with covers (a book without a cover falls
 back to a page-one text preview); highlight a sentence to collect it, write a thought, or ask the AI — the book,
-chapter and selected text travel with your question. EPUB, TXT, Markdown and HTML are read natively; PDF, AZW3, MOBI,
-AZW, DOCX, FB2 and RTF are converted on first open through a local [Calibre](https://calibre-ebook.com/) install (a
-cached copy is kept, the original file is never touched). Thoughts become Markdown knowledge cards in your own folder
+chapter and selected text travel with your question. EPUB and TXT are read natively; PDF, AZW3, MOBI,
+AZW and FB2 are converted on first open through a local [Calibre](https://calibre-ebook.com/) install (a
+cached copy is kept, the original file is never touched). Converted books get chapter names from their first
+in-text heading, so a PDF's table of contents reads like a book instead of "Section 1, Section 2…". Thoughts become
+Markdown knowledge cards in your own folder
 (with backlinks and cross-book search), and finishing a book turns the conversation into an article in your knowledge
 base.
+
+For example, put *Flowers for Algernon* (EPUB) and *Deep Learning from Scratch* (PDF) into the same folder: the EPUB
+opens directly, the PDF is converted once through Calibre and then reads like any other book — same shelf, same
+progress, same notes.
 
 Install it from the DSH workbench market or as a plugin bundle, restart DSH Desktop, then pick your books folder
 and knowledge-base folder once. Everything stays local as plain Markdown; original book files are never modified.

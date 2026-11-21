@@ -20,7 +20,8 @@ window.__ModuleLoader__.load({
     const RPC_CHANNEL = '/reading'
     const PANEL_KEY = 'reading'
     const TYPE_LABELS = { concept: '概念', opinion: '观点', question: '问题', application: '应用' }
-    const FORMAT_BADGE = { pdf: 'PDF', azw3: 'AZW3', azw: 'AZW', mobi: 'MOBI', txt: 'TXT', md: 'MD', html: 'HTML', docx: 'DOCX', fb2: 'FB2', rtf: 'RTF' }
+    const FORMAT_BADGE = { pdf: 'PDF', azw3: 'AZW3', azw: 'AZW', mobi: 'MOBI', txt: 'TXT', fb2: 'FB2' }
+    const LIBRARY_EXTENSIONS = '.epub,.pdf,.azw3,.azw,.mobi,.txt,.fb2'
     const THEME_LABELS = { auto: '跟随', paper: '米纸', dark: '夜读' }
     const FONT_FAMILIES = [
       { key: 'song', label: '宋体', stack: '"SimSun", "宋体", "Songti SC", "STSong", serif' },
@@ -133,11 +134,14 @@ window.__ModuleLoader__.load({
         config: null,
         settings: { fontSize: 18, lineHeight: 1.9, theme: 'auto', chatScope: 'book', family: 'serif' },
         books: [],
+        importing: false,
+        importMessage: '',
         booksLoading: false,
         booksWarning: '',
         lastScan: 0,
         view: 'shelf',
         book: null,
+        navigation: null,
         chapter: null,
         pendingRestore: null,
         tocOpen: false,
@@ -186,6 +190,10 @@ window.__ModuleLoader__.load({
     let progressTimer = null
     let navigationRequest = 0
     let notesRequest = 0
+    let noteRequest = 0
+    let quoteRequest = 0
+    let reviewRequest = 0
+    let reportsRequest = 0
     let lastActivityAt = Date.now()
     let pendingSeconds = 0
     const position = { ratio: 0, blockIndex: 0 }
@@ -276,16 +284,77 @@ window.__ModuleLoader__.load({
       }
     }
 
-    async function refreshBooks() {
+    async function refreshBooks(force = false) {
       if (store.state.booksLoading) return
       store.set({ booksLoading: true })
       try {
-        const result = await rpc('books/list')
+        const result = await rpc('books/list', { force })
         store.set({ books: result.books || [], booksLoading: false, booksWarning: result.warning || '', lastScan: Date.now(), error: '' })
       } catch (error) {
         store.set({ booksLoading: false, error: errText(error) })
         report('books-error', { message: errText(error) })
       }
+    }
+
+    function importSummary(results) {
+      const imported = results.filter(item => item.imported).length
+      const duplicate = results.filter(item => item.duplicate).length
+      const errors = results.filter(item => item.error)
+      return '已导入 ' + imported + ' 个文件' + (duplicate ? '，已存在 ' + duplicate + ' 个' : '')
+        + (errors.length ? '；未导入：' + errors.map(item => item.name + '（' + item.error + '）').join('；') : '')
+    }
+
+    async function importFiles(files) {
+      if (store.state.importing) return
+      const entries = Array.from(files || [])
+      if (!entries.length) return
+      store.set({ importing: true, importMessage: '正在导入…' })
+      const results = []
+      try {
+        for (let i = 0; i < entries.length; i++) {
+          const file = entries[i]
+          let job
+          try {
+            job = await rpc('library/import/start', { name: file.name, size: file.size })
+            const chunkBytes = Math.min(Number(job.chunkBytes) || 3 * 1024 * 1024, 3 * 1024 * 1024)
+            for (let offset = 0; offset < file.size; offset += chunkBytes) {
+              const buffer = new Uint8Array(await file.slice(offset, offset + chunkBytes).arrayBuffer())
+              let binary = ''
+              for (let start = 0; start < buffer.length; start += 32768) binary += String.fromCharCode(...buffer.subarray(start, start + 32768))
+              await rpc('library/import/chunk', { id: job.id, offset, data: btoa(binary) })
+              store.set({ importMessage: '正在导入 ' + (i + 1) + '/' + entries.length + '：' + file.name + ' · ' + Math.round(Math.min(file.size, offset + chunkBytes) / file.size * 100) + '%' })
+            }
+            results.push(await rpc('library/import/finish', { id: job.id }))
+          } catch (error) {
+            if (job) await rpc('library/import/cancel', { id: job.id }).catch(() => {})
+            results.push({ name: file.name, error: errText(error) })
+          }
+        }
+        store.set({ importMessage: importSummary(results) })
+        await refreshBooks(true)
+      } finally { store.set({ importing: false }) }
+    }
+
+    async function importPaths(paths) {
+      if (store.state.importing) return
+      store.set({ importing: true, importMessage: '正在复制文件到目标库…' })
+      try {
+        const result = await rpc('library/import/paths', { paths })
+        store.set({ importMessage: importSummary(result.results || []) })
+        await refreshBooks(true)
+      } catch (error) { store.set({ importMessage: '导入失败：' + errText(error) }) }
+      finally { store.set({ importing: false }) }
+    }
+
+    async function importClipboard() {
+      if (store.state.importing) return
+      store.set({ importing: true, importMessage: '正在读取剪贴板文件…' })
+      try {
+        const result = await rpc('library/import/clipboard')
+        store.set({ importMessage: result.empty ? '剪贴板中没有文件。请先在文件管理器复制文件，或使用拖入和导入按钮。' : importSummary(result.results || []) })
+        await refreshBooks(true)
+      } catch (error) { store.set({ importMessage: '粘贴失败：' + errText(error) }) }
+      finally { store.set({ importing: false }) }
     }
 
     async function setupDirectories(epubDir, kbDir) {
@@ -298,10 +367,15 @@ window.__ModuleLoader__.load({
     }
 
     async function openBook(bookId) {
+      if (store.state.navigation && store.state.navigation.bookId === bookId && store.state.navigation.kind === 'book') return
       const request = ++navigationRequest
-      store.set({ error: '' })
-      await flushReading()
       const metaBook = store.state.books.find((item) => item.id === bookId)
+      store.set({ error: '', navigation: { kind: 'book', bookId, title: metaBook ? metaBook.title : '' } })
+      if (progressTimer !== null) { clearTimeout(progressTimer); progressTimer = null }
+      await saveProgressNow()
+      if (request !== navigationRequest) return
+      await flushReading()
+      if (request !== navigationRequest) return
       if (metaBook !== undefined && metaBook.format !== undefined && metaBook.format !== 'epub'
         && !['txt', 'md', 'html'].includes(metaBook.format) && !metaBook.chapterCount) {
         toast('正在把 ' + (FORMAT_BADGE[metaBook.format] || String(metaBook.format).toUpperCase()) + ' 转成可读版本，第一次会慢一点…')
@@ -310,6 +384,8 @@ window.__ModuleLoader__.load({
         const result = await rpc('book/open', { bookId })
         if (request !== navigationRequest) return
         const progress = result.progress || {}
+        position.ratio = Number(progress.scrollRatio) || 0
+        position.blockIndex = Number(progress.blockIndex) || 0
         store.set({
           book: result.book,
           chapter: result.chapter,
@@ -317,12 +393,16 @@ window.__ModuleLoader__.load({
           tocOpen: false,
           settingsOpen: false,
           selection: null,
+          quoteDraft: null,
+          quoteRanges: [],
+          navigation: null,
           pendingRestore: {
             token: Date.now(),
             ratio: Number(progress.scrollRatio) || 0,
             blockIndex: Number(progress.blockIndex) || 0,
           },
         })
+        quoteRequest += 1
         bumpActivity()
         saveSettings({ lastBookId: bookId })
         loadQuoteRanges()
@@ -330,34 +410,56 @@ window.__ModuleLoader__.load({
         reportContext({})
       } catch (error) {
         if (request !== navigationRequest) return
-        store.set({ error: errText(error) })
+        store.set({ error: errText(error), navigation: null })
         toast('打开失败：' + errText(error))
         report('book-open-error', { message: errText(error) })
       }
     }
 
     async function gotoChapter(index) {
-      const request = ++navigationRequest
       const state = store.state
       if (!state.book) return
+      const bookId = state.book.id
       const total = state.book.chapters ? state.book.chapters.length : 0
       const next = Math.max(0, Math.min(total - 1, Number(index) || 0))
+      const request = ++navigationRequest
+      store.set({ navigation: { kind: 'chapter', bookId }, error: '' })
+      if (progressTimer !== null) { clearTimeout(progressTimer); progressTimer = null }
       await saveProgressNow()
+      if (request !== navigationRequest) return
       try {
-        const result = await rpc('book/chapter', { bookId: state.book.id, index: next })
+        const result = await rpc('book/chapter', { bookId, index: next })
         if (request !== navigationRequest) return
+        position.ratio = 0
+        position.blockIndex = 0
+        quoteRequest += 1
         store.set({
           chapter: result.chapter,
           pendingRestore: { token: Date.now(), ratio: 0, blockIndex: 0 },
           tocOpen: false,
           selection: null,
+          quoteDraft: null,
+          quoteRanges: [],
+          navigation: null,
         })
         loadQuoteRanges()
         reportContext({ selection: '' })
       } catch (error) {
         if (request !== navigationRequest) return
+        store.set({ navigation: null })
         toast('切换章节失败：' + errText(error))
       }
+    }
+
+    function cancelNavigation() {
+      navigationRequest += 1
+      store.set({ navigation: null })
+    }
+
+    function changeView(view) {
+      cancelNavigation()
+      noteRequest += 1
+      store.set({ view, tocOpen: false, settingsOpen: false, selection: null })
     }
 
     async function saveProgressNow() {
@@ -441,27 +543,41 @@ window.__ModuleLoader__.load({
     }
 
     async function openNote(id) {
+      const request = ++noteRequest
       try {
         const result = await rpc('kb/note', { id })
+        if (request !== noteRequest) return
         store.set({ kbDetail: result.note })
       } catch (error) {
+        if (request !== noteRequest) return
         toast('读取笔记失败：' + errText(error))
       }
+    }
+
+    function closeNote() {
+      noteRequest += 1
+      store.set({ kbDetail: null })
     }
 
     // Quote cards: the reader can save a selected passage as a knowledge card
     // without asking the AI, and reopen the book with the passage underlined.
     async function loadQuoteRanges() {
       const state = store.state
+      const request = ++quoteRequest
       if (!state.book || !state.chapter) { store.set({ quoteRanges: [] }); return }
+      const bookId = state.book.id
+      const chapterIndex = state.chapter.index
+      const isCurrent = () => request === quoteRequest && store.state.book && store.state.book.id === bookId
+        && store.state.chapter && store.state.chapter.index === chapterIndex
       try {
         const result = await rpc('quote/list', {
           bookId: state.book.id,
           book: state.book.title,
           chapterIndex: state.chapter.index,
         })
-        store.set({ quoteRanges: (result && result.quotes) || [] })
+        if (isCurrent()) store.set({ quoteRanges: (result && result.quotes) || [] })
       } catch (error) {
+        if (!isCurrent()) return
         store.set({ quoteRanges: [] })
         report('quote-list-error', { message: errText(error) })
       }
@@ -501,23 +617,32 @@ window.__ModuleLoader__.load({
     async function openReview(book) {
       const target = book || store.state.book
       if (!target) return
-      store.set({ view: 'review', reviewBook: target, reviewLoading: true, tocOpen: false, settingsOpen: false, selection: null })
+      changeView('review')
+      const request = ++reviewRequest
+      const reportRequest = ++reportsRequest
+      store.set({ reviewBook: target, reviewNotes: [], reports: [], reviewLoading: true })
       bumpActivity()
       try {
         const notesResult = await rpc('kb/list', { book: target.title, limit: 200 }).catch(() => ({ notes: [] }))
+        if (request !== reviewRequest) return
         const reportsResult = await rpc('report/list', { book: target.title, limit: 100 }).catch(() => ({ reports: [] }))
-        store.set({ reviewNotes: notesResult.notes || [], reports: reportsResult.reports || [], reviewLoading: false })
+        if (request !== reviewRequest) return
+        store.set({ reviewNotes: notesResult.notes || [], reviewLoading: false,
+          ...(reportRequest === reportsRequest ? { reports: reportsResult.reports || [] } : {}) })
         report('review-open', { book: target.title, notes: (notesResult.notes || []).length })
       } catch (error) {
+        if (request !== reviewRequest) return
         store.set({ reviewLoading: false })
         report('review-error', { message: errText(error) })
       }
     }
 
     async function refreshReports(book) {
+      const request = ++reportsRequest
       const title = (book && book.title) || (store.state.reviewBook && store.state.reviewBook.title) || ''
       try {
         const result = await rpc('report/list', { book: title, limit: 100 })
+        if (request !== reportsRequest || !store.state.reviewBook || store.state.reviewBook.title !== title) return
         store.set({ reports: result.reports || [] })
       } catch (error) {
         report('reports-error', { message: errText(error) })
@@ -613,11 +738,15 @@ window.__ModuleLoader__.load({
 .rcc-left{flex:0 0 60%;min-width:0;display:flex;flex-direction:column;border-right:1px solid var(--dsw-alias-border-l2);position:relative;overflow:hidden;background:var(--dsw-alias-bg-base)}
 .rcc-center-loading{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;height:100%;color:var(--dsw-alias-label-secondary)}
 .rcc-empty{padding:36px 24px;text-align:center;color:var(--dsw-alias-label-tertiary);font-size:13px}
+.rcc-import-notice{position:absolute;right:12px;top:58px;z-index:100;width:min(360px,calc(100% - 24px));max-height:min(240px,calc(100% - 80px));display:flex;flex-direction:column;overflow:hidden;border:1px solid var(--dsw-alias-border-l2,#cbd1d8);border-radius:12px;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary,#202124);box-shadow:0 8px 28px rgba(0,0,0,.18)}
+.rcc-import-notice-head{flex:0 0 auto;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 12px;border-bottom:1px solid var(--dsw-alias-border-l2,#cbd1d8)}
+.rcc-import-notice-body{min-height:0;overflow:auto;padding:12px;font-size:13px;line-height:1.7;white-space:normal;overflow-wrap:anywhere}
 /* shelf */
 .rcc-shelf{display:flex;flex-direction:column;height:100%;min-height:0}
 .rcc-shelf-head{flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid var(--dsw-alias-border-l2);flex-wrap:wrap}
 .rcc-shelf-head .rcc-input{flex:1 1 180px}
 .rcc-grid{flex:1 1 auto;min-height:0;overflow-y:auto;padding:16px 16px 48px;display:grid;grid-template-columns:repeat(auto-fill,minmax(132px,1fr));gap:20px 16px;align-content:start}
+.rcc-shelf[data-drag=true]{outline:3px dashed var(--dsw-alias-state-business-primary);outline-offset:-5px}
 .rcc-book{display:flex;flex-direction:column;gap:5px;min-width:0;padding:0;border:none;background:transparent;text-align:left;font-family:inherit;color:var(--dsw-alias-label-primary);cursor:pointer}
 .rcc-cover{position:relative;width:100%;aspect-ratio:3/4;border-radius:8px;overflow:hidden;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l1);box-shadow:0 2px 8px rgba(0,0,0,.14);display:flex;align-items:center;justify-content:center}
 .rcc-cover img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block}
@@ -775,6 +904,27 @@ window.__ModuleLoader__.load({
       return h('style', { 'data-reading-companion': 'style', dangerouslySetInnerHTML: { __html: CSS } })
     }
 
+    function ImportNotice() {
+      const state = useStore()
+      const [paused, setPaused] = useState(false)
+      useEffect(() => {
+        if (!state.importMessage || state.importing || paused) return
+        const timer = setTimeout(() => store.set({ importMessage: '' }), 5000)
+        return () => clearTimeout(timer)
+      }, [state.importMessage, state.importing, paused])
+      if (!state.importMessage) return null
+      return h('aside', {
+        className: 'rcc-import-notice', role: 'status', 'aria-live': 'polite', 'aria-label': '导入通知',
+        onMouseEnter: () => setPaused(true), onMouseLeave: () => setPaused(false),
+        onFocus: () => setPaused(true), onBlur: (event) => { if (!event.currentTarget.contains(event.relatedTarget)) setPaused(false) },
+      },
+        h('div', { className: 'rcc-import-notice-head' },
+          h('strong', null, state.importing ? '正在导入' : '导入结果'),
+          !state.importing ? h('button', { className: 'rcc-ghost', 'aria-label': '关闭导入通知', onClick: () => store.set({ importMessage: '' }) }, '×') : null),
+        h('div', { className: 'rcc-import-notice-body' }, state.importMessage),
+      )
+    }
+
     function Toast() {
       const state = useStore()
       useEffect(() => {
@@ -784,6 +934,18 @@ window.__ModuleLoader__.load({
       }, [state.toast])
       if (!state.toast) return null
       return h('div', { className: 'rcc-toast' }, state.toast)
+    }
+
+    function NavigationStatus() {
+      const state = useStore()
+      if (!state.navigation) return null
+      const opening = state.navigation.kind === 'book'
+      return h('div', { className: 'rcc-workbench-tip', role: 'status', 'aria-live': 'polite' },
+        h('span', null, opening
+          ? '正在打开' + (state.navigation.title ? bookLabel(state.navigation.title) : '书籍') + '…首次转换可能需要几分钟。停止等待后，后台转换仍会继续。'
+          : '正在加载章节…'),
+        h('button', { className: 'rcc-btn', onClick: cancelNavigation }, '停止等待'),
+      )
     }
 
     // ------------------------------------------------------------------
@@ -826,7 +988,7 @@ window.__ModuleLoader__.load({
         const epub = epubDir.trim()
         const kb = kbDir.trim()
         if (epub.length === 0 || kb.length === 0) {
-          setError('请先选择或填写 EPUB 书籍文件夹和知识库文件夹。')
+          setError('请先选择或填写 阅读文件夹和知识库文件夹。')
           return
         }
         setBusy(true)
@@ -844,10 +1006,10 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'rcc-setup-wrap' },
         h('div', { className: 'rcc-setup' },
           h('h1', null, '随读 · 第一次使用'),
-          h('p', null, '只需要设置一次：告诉我你的 EPUB 文件夹和知识库文件夹。之后所有书、笔记和阅读进度都会自动记住。'),
+          h('p', null, '只需要设置一次：告诉我你的阅读文件夹和知识库文件夹。之后所有书、笔记和阅读进度都会自动记住。'),
           h('p', { className: 'rcc-setup-hint' }, '如果之前已经设置过，出现这个页面说明配置没有读到；请重新选择你原来的书库目录。'),
           h('div', { className: 'rcc-field' },
-            h('label', null, 'EPUB 书籍文件夹'),
+            h('label', null, '阅读文件夹'),
             h('div', { className: 'rcc-field-row' },
               h('input', {
                 className: 'rcc-input',
@@ -874,7 +1036,7 @@ window.__ModuleLoader__.load({
           h('div', { className: 'rcc-field-row', style: { justifyContent: 'flex-end' } },
             h('button', { className: 'rcc-btn', disabled: busy, onClick: submit }, busy ? '正在准备书架…' : '开始阅读'),
           ),
-          h('p', null, '原始 EPUB 文件只会被读取，不会被修改、移动或覆盖。'),
+          h('p', null, '原始文件只会被读取，不会被修改、移动或覆盖。'),
         ),
       )
     }
@@ -885,7 +1047,22 @@ window.__ModuleLoader__.load({
     function ShelfView(props) {
       const state = props.state
       const [query, setQuery] = useState('')
+      const [dragging, setDragging] = useState(false)
+      const [visibleCount, setVisibleCount] = useState(100)
+      const inputRef = useRef(null)
+      const shelfRef = useRef(null)
       const books = state.books
+      useEffect(() => { setVisibleCount(100) }, [query])
+      useEffect(() => {
+        const refresh = () => {
+          if (document.visibilityState !== 'hidden' && shelfRef.current?.getClientRects().length && !store.state.importing) refreshBooks(true)
+        }
+        const timer = setInterval(refresh, 10000)
+        window.addEventListener('focus', refresh)
+        document.addEventListener('visibilitychange', refresh)
+        refresh()
+        return () => { clearInterval(timer); window.removeEventListener('focus', refresh); document.removeEventListener('visibilitychange', refresh) }
+      }, [])
       const filtered = useMemo(() => {
         const text = query.trim()
         if (text.length === 0) return books
@@ -893,7 +1070,21 @@ window.__ModuleLoader__.load({
       }, [books, query])
       const current = useMemo(() => books.find((book) => book.progress && book.progress.lastRead), [books])
       const todayMinutes = Math.round((Number(state.todaySeconds) || 0) / 60)
-      return h('div', { className: 'rcc-shelf' },
+      return h('div', {
+        ref: shelfRef, className: 'rcc-shelf', tabIndex: 0, 'aria-label': '阅读文件库', 'data-drag': dragging,
+        onDragOver: (event) => { if (Array.from(event.dataTransfer?.types || []).includes('Files')) { event.preventDefault(); setDragging(true) } },
+        onDragLeave: (event) => { if (!event.currentTarget.contains(event.relatedTarget)) setDragging(false) },
+        onDrop: (event) => { event.preventDefault(); setDragging(false); importFiles(event.dataTransfer?.files) },
+        onPaste: (event) => {
+          if (['INPUT', 'TEXTAREA'].includes(event.target.tagName) || event.target.isContentEditable) return
+          const files = event.clipboardData?.files
+          if (files?.length) { event.preventDefault(); importFiles(files); return }
+          const paths = String(event.clipboardData?.getData('text/plain') || '').trim().split(/\r?\n/).map(value => value.trim().replace(/^"|"$/g, '')).filter(Boolean)
+          if (paths.length && paths.every(value => /^(?:[a-z]:[\\/]|\/)/i.test(value))) { event.preventDefault(); importPaths(paths); return }
+          event.preventDefault(); importClipboard()
+        },
+      },
+        h('input', { ref: inputRef, type: 'file', multiple: true, accept: LIBRARY_EXTENSIONS, style: { display: 'none' }, onChange: (event) => { importFiles(event.target.files); event.target.value = '' } }),
         h('div', { className: 'rcc-shelf-head' },
           h('input', {
             className: 'rcc-input',
@@ -901,8 +1092,10 @@ window.__ModuleLoader__.load({
             value: query,
             onChange: (event) => setQuery(event.target.value),
           }),
-          h('button', { className: 'rcc-btn', disabled: state.booksLoading, onClick: () => refreshBooks() }, state.booksLoading ? '扫描中…' : '刷新书架'),
-          h('span', { className: 'rcc-muted' }, String(books.length) + ' 本'),
+          h('button', { className: 'rcc-btn', disabled: state.importing, onClick: () => inputRef.current?.click() }, state.importing ? '导入中…' : '导入文件'),
+          h('button', { className: 'rcc-btn', disabled: state.importing, onClick: importClipboard }, '粘贴文件'),
+          h('button', { className: 'rcc-btn', disabled: state.booksLoading, onClick: () => refreshBooks(true) }, state.booksLoading ? '扫描中…' : '刷新'),
+          h('span', { className: 'rcc-muted' }, String(books.length) + ' 个'),
           todayMinutes > 0 ? h('span', { className: 'rcc-muted' }, '· 今日已读 ' + todayMinutes + ' 分钟') : null,
         ),
         current
@@ -924,7 +1117,7 @@ window.__ModuleLoader__.load({
           ? h('div', { className: 'rcc-empty' }, '正在扫描书架…')
           : filtered.length === 0
             ? h('div', { className: 'rcc-empty' }, books.length === 0 ? (state.booksWarning ? '书库读取失败：' + state.booksWarning : '这个文件夹里还没有可读的书籍。') : '没有找到匹配的书。')
-            : h('div', { className: 'rcc-grid' }, filtered.slice(0, 400).map((book) => h('div', {
+            : h('div', { className: 'rcc-grid' }, filtered.slice(0, visibleCount).map((book) => h('div', {
               key: book.id,
               className: 'rcc-book',
               role: 'button',
@@ -963,7 +1156,7 @@ window.__ModuleLoader__.load({
                 onClick: (event) => { event.stopPropagation(); openReview(book) },
               }, '回顾'),
             ),
-            ))),
+            )), filtered.length > visibleCount ? h('button', { className: 'rcc-btn', onClick: () => setVisibleCount(count => count + 100) }, '继续显示（' + visibleCount + '/' + filtered.length + '）') : null),
       )
     }
 
@@ -998,7 +1191,7 @@ window.__ModuleLoader__.load({
     }
 
     function openQuoteNote(id) {
-      store.set({ view: 'kb', kbDetail: null, tocOpen: false, settingsOpen: false, selection: null })
+      changeView('kb'); closeNote()
       loadNotes()
       openNote(id)
     }
@@ -1229,7 +1422,7 @@ window.__ModuleLoader__.load({
         onClick: () => { if (store.state.settingsOpen) store.set({ settingsOpen: false }) },
       },
       h('div', { className: 'rcc-reader-head' },
-        h('button', { className: 'rcc-ghost', onClick: () => store.set({ view: 'shelf', tocOpen: false, selection: null }) }, '书架'),
+        h('button', { className: 'rcc-ghost', onClick: () => changeView('shelf') }, '书架'),
         h('div', { className: 'rcc-reader-title' }, bookLabel(book.title)),
         h('span', { className: 'rcc-muted' }, book.author || ''),
         h('div', { className: 'rcc-grow' }),
@@ -1302,7 +1495,7 @@ window.__ModuleLoader__.load({
         const backlinks = Array.isArray(detail.backlinks) ? detail.backlinks : []
         return h('div', { className: 'rcc-kb' },
           h('div', { className: 'rcc-kb-head' },
-            h('button', { className: 'rcc-ghost', onClick: () => store.set({ kbDetail: null }) }, '返回列表'),
+            h('button', { className: 'rcc-ghost', onClick: closeNote }, '返回列表'),
             h('span', { className: 'rcc-muted' }, (TYPE_LABELS[detail.type] || detail.type || '') + (detail.book ? ' · ' + bookLabel(detail.book) : '')),
           ),
           h('div', { className: 'rcc-kb-detail' },
@@ -1453,7 +1646,7 @@ window.__ModuleLoader__.load({
       const [content, setContent] = useState('')
       const [saving, setSaving] = useState(false)
       const bookTitle = reviewBook ? String(reviewBook.title || '') : ''
-      const defaultTitle = () => (bookTitle ? '《' + bookLabel(bookTitle) + '》读书心得' : '读书心得')
+      const defaultTitle = () => (bookTitle ? bookLabel(bookTitle) + '读书心得' : '读书心得')
 
       const grouped = useMemo(() => {
         const groups = []
@@ -1544,7 +1737,7 @@ window.__ModuleLoader__.load({
           h('span', { className: 'rcc-review-title' }, bookLabel(bookTitle)),
           h('span', { className: 'rcc-muted' }, notes.length + ' 条笔记 · ' + reports.length + ' 篇心得'),
           h('div', { className: 'rcc-grow' }),
-          h('button', { className: 'rcc-ghost', onClick: () => store.set({ view: 'shelf' }) }, '回到书架'),
+          h('button', { className: 'rcc-ghost', onClick: () => changeView('shelf') }, '回到书架'),
         ),
         h('div', { className: 'rcc-review-body' },
           h('div', { className: 'rcc-review-col' },
@@ -1557,7 +1750,7 @@ window.__ModuleLoader__.load({
                 group.notes.map((note) => h('button', {
                   key: note.id,
                   className: 'rcc-review-note',
-                  onClick: () => { store.set({ view: 'kb' }); openNote(note.id) },
+                  onClick: () => { changeView('kb'); openNote(note.id) },
                 },
                 h('span', { className: 'rcc-review-note-type' }, '【' + (TYPE_LABELS[note.type] || note.type || '笔记') + '】'),
                 note.title || note.core || note.id,
@@ -1569,7 +1762,7 @@ window.__ModuleLoader__.load({
               openQuestions.map((note) => h('button', {
                 key: note.id,
                 className: 'rcc-review-note',
-                onClick: () => { store.set({ view: 'kb' }); openNote(note.id) },
+                onClick: () => { changeView('kb'); openNote(note.id) },
               }, '· ' + (note.title || note.core || note.id))),
             ) : null,
             h('div', { className: 'rcc-review-section' },
@@ -1752,7 +1945,7 @@ window.__ModuleLoader__.load({
       const viewButton = (label, view) => h('button', {
         className: 'rcc-chip' + (state.view === view ? ' rcc-chip-on' : ''),
         onClick: () => {
-          store.set({ view, tocOpen: false, settingsOpen: false })
+          changeView(view)
           if (view === 'kb') loadNotes()
         },
       }, label)
@@ -1760,7 +1953,7 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'rcc-root' },
         h(StyleSheet),
         h('div', { className: 'rcc-top' },
-          h('div', { className: 'rcc-brand' }, '随读'),
+          h('div', { className: 'rcc-brand' }, '随读 · 0.5.1'),
           h('div', { className: 'rcc-nav' },
             viewButton('书架', 'shelf'),
             state.book ? viewButton('阅读', 'read') : null,
@@ -1789,6 +1982,8 @@ window.__ModuleLoader__.load({
           ),
           h(ChatColumn, props),
         ),
+        h(NavigationStatus, null),
+        h(ImportNotice, null),
         h(Toast, null),
         state.error && state.view !== 'shelf' ? h('div', { className: 'rcc-toast' }, state.error) : null,
       )
@@ -1983,7 +2178,7 @@ window.__ModuleLoader__.load({
       const viewButton = (label, view) => h('button', {
         className: 'rcc-chip' + (state.view === view ? ' rcc-chip-on' : ''),
         onClick: () => {
-          store.set({ view, tocOpen: false, settingsOpen: false })
+          changeView(view)
           if (view === 'kb') loadNotes()
         },
       }, label)
@@ -1991,7 +2186,7 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'rcc-root rcc-workbench' },
         h(StyleSheet),
         h('div', { className: 'rcc-top' },
-          h('div', { className: 'rcc-brand' }, '随读'),
+          h('div', { className: 'rcc-brand' }, '随读 · 0.5.1'),
           h('div', { className: 'rcc-nav' },
             viewButton('书架', 'shelf'),
             state.book ? viewButton('阅读', 'read') : null,
@@ -2022,6 +2217,8 @@ window.__ModuleLoader__.load({
           h('span', null, '右侧还没有伴读对话。可以随时阅读；选中原文时开始对话，AI 就能看到书名、章节和原文。'),
           h('button', { className: 'rcc-btn', onClick: startConversation }, '开始伴读对话'),
         ),
+        h(NavigationStatus, null),
+        h(ImportNotice, null),
         h(Toast, null),
         state.error && state.view !== 'shelf' ? h('div', { className: 'rcc-toast' }, state.error) : null,
       )
@@ -2124,7 +2321,7 @@ window.__ModuleLoader__.load({
       } catch (error) {
         report('register-workbench-error', { message: errText(error) })
       }
-      report('client-ready', { version: '0.4.0' })
+      report('client-ready', { version: '0.5.1' })
     }
 
     return { inject: ['slots', 'connection'], apply }
